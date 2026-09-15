@@ -1,28 +1,36 @@
 (() => {
   const item = document.querySelector('#mainContent [id^="item_"]');
-  const keyword = item?.querySelector(
+  if (!item) return null;
+
+  const keyword = item.querySelector(
     'a[href*="/products/"] > span'
   )?.textContent.trim();
 
-  if (!keyword) return null;
+  const coinsText = item.textContent
+    .match(/\$\s*([\d,]+)\s*酷澎幣回饋/)?.[1];
 
-  const tip = [...document.querySelectorAll('.coupon-condition .d1')]
-    .find(el => el.textContent.includes(keyword));
+  const coins = coinsText
+    ? Number(coinsText.replace(/,/g, ''))
+    : null;
 
-  if (!tip) return null;
+  const tip = keyword
+    ? [...document.querySelectorAll('.coupon-condition .d1')]
+        .find(el => el.textContent.includes(keyword))
+    : null;
 
-  let row = tip.parentElement;
+  let row = tip?.parentElement;
   while (row && !row.querySelector('input[name="coupon"]')) {
     row = row.parentElement;
   }
 
   const amount = row?.querySelector('label strong')?.textContent;
-  if (!amount) return null;
+  const coupon = amount
+    ? Number(amount.replace(/[^\d.]/g, ''))
+    : null;
 
-  const coupon = Number(amount.replace(/[^\d.]/g, ''));
-  const coins = item.textContent
-    .match(/\$\s*([\d,]+)\s*酷澎幣回饋/)?.[1]
-    ?.replace(/,/g, '');
+  const result = [coins, coupon]
+    .filter(value => value !== null)
+    .join('+') || 'null';
 
-  return coins ? `${coins}+${coupon}` : coupon;
+  return `${result} (酷澎幣${coins}，優惠券${coupon})`;
 })();
