@@ -1,6 +1,7 @@
 (() => {
-  const keyword = document.querySelector(
-    '#mainContent [id^="item_"] a[href*="/products/"] > span'
+  const item = document.querySelector('#mainContent [id^="item_"]');
+  const keyword = item?.querySelector(
+    'a[href*="/products/"] > span'
   )?.textContent.trim();
 
   if (!keyword) return null;
@@ -16,5 +17,12 @@
   }
 
   const amount = row?.querySelector('label strong')?.textContent;
-  return amount ? Number(amount.replace(/[^\d.]/g, '')) : null;
+  if (!amount) return null;
+
+  const coupon = Number(amount.replace(/[^\d.]/g, ''));
+  const coins = item.textContent
+    .match(/\$\s*([\d,]+)\s*酷澎幣回饋/)?.[1]
+    ?.replace(/,/g, '');
+
+  return coins ? `${coins}+${coupon}` : coupon;
 })();
