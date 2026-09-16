@@ -4,7 +4,7 @@
  */
 (function (global) {
   'use strict';
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const norm = s => String(s ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim();
   const num = s => Number(String(s).replace(/,/g, ''));
   const round = n => Math.round((n + Number.EPSILON) * 1);
@@ -206,6 +206,32 @@
     return out;
   }
 
+  function buildPageNotes(page) {
+    const noteDetails=[], seen=new Set();
+    const add=(category,text,status)=>{
+      text=norm(text);if(!text||seen.has(text))return;
+      seen.add(text);noteDetails.push({category,text,status});
+    };
+    const state=o=>o.eligibility?.status==='excluded'?'不採用：'+(o.eligibility.reasons||[]).join('、'):'頁面顯示，條件待核對';
+    for(const o of page.discountActivities||[]){
+      const title=norm(o.name||o.raw), badge=norm(o.displayLabel);
+      add('折扣活動',badge&&badge!==title?badge+' '+title:title,state(o));
+    }
+    for(const o of page.rewardActivities||[]){
+      if(!/mo(?:mo)?\s*點|mopro/i.test(o.name||o.raw||''))continue;
+      add('贈品／會員回饋',o.name||o.raw,state(o)+(o.kind==='pointsMopro'?'；需看贈品明細區分全站與專屬會員分支':''));
+    }
+    for(const o of page.rewardBranches||[]){
+      if(!/mo(?:mo)?\s*點|mopro/i.test(o.name||o.raw||''))continue;
+      add('贈品明細',o.name||o.raw,o.kind==='pointsMopro'?'moPro專屬送點僅備註，不計入回饋':state(o));
+    }
+    for(const text of page.mopro?.evidence||[]){
+      if(noteDetails.some(o=>o.text.includes(norm(text))))continue;
+      add('moPro',text,'頁面顯示，條件待核對');
+    }
+    return {note_momo:noteDetails.map(o=>o.text+'（'+o.status+'）').join('/'),noteDetails,
+      noteStatus:'page_observation_only',noteMeaning:'頁面所見備註；不表示優惠已採用，也不變更折扣或回饋計算'};
+  }
   function scan(doc = document, url = location.href) {
     const platform=detect(url), warnings=[], all=Array.from(doc.querySelectorAll('*'));
     const visible=e=> !e.closest('[data-momo-audit],script,style,template') && e.getClientRects().length>0 && doc.defaultView.getComputedStyle(e).visibility!=='hidden';
@@ -227,6 +253,7 @@
     for(const a of main.querySelectorAll('a[href*="promoNo="],a[href*="func=18"]')) {
       if(!visible(a)||a.closest('aside,header,footer,nav'))continue;
       let name=txt(a);if(!name||/^(前往活動賣場|登記活動)$/.test(name))continue;
+      const displayLabel=name;
       let group=a.parentElement;
       for(let i=0;i<3&&group.parentElement;i++){if(/登記送|免登記|滿件贈|满額贈|贈品/.test(txt(group)))break;if(txt(group.parentElement).length>2500)break;group=group.parentElement;}
       const context=txt(group), href=a.getAttribute('href');
@@ -236,7 +263,7 @@
       let kind=/mo(?:mo)?\s*點/i.test(name)?(/moPro/i.test(name)?'pointsMopro':'points'):/mo(?:mo)?\s*幣/i.test(name)?'coin':/送|贈/.test(name)?'gift':platform.type==='mo+'?(/跨店/.test(context)?'crossActivity':'shopActivity'):'activity';
       const offer=parseOffer(name,kind);
       if(/登記送/.test(context)||/[?&]func=18(?:&|$)/.test(href))offer.requiresRegistration=true;
-      promotions.push({...offer,source:href,context,eligibility:eligibility(offer,platform.type)});
+      promotions.push({...offer,displayLabel,source:href,context,eligibility:eligibility(offer,platform.type)});
     }
     // 價格上方的折扣連結可能只有「95折」，改取同列完整門檻。
     for(const e of all.filter(e=>visible(e)&&e.childElementCount===0&&/^滿.*(?:折|減)/.test(txt(e))&&root.contains(e))) {
@@ -302,9 +329,10 @@
       shipping:{auditFee:platform.type==='momo'?0:null,methods:shipping,reason:platform.type==='momo'?'依教材填 0，不代表平台訂單免運':'需以普通折扣後金額重新判定'},
       productWarnings:unique(raw.match(/有貨通知|已售完|售完補貨|無庫存|缺貨|預購|福利品|限購[^。\n]{0,30}/g)||[]),
       detailTexts:unique(dialogs),detailActions:actions,warnings};
+    Object.assign(result,buildPageNotes(result));
     return result;
   }
-  const api={version:VERSION,detect,parsePrice,parseOrderDiscount,readOrderDiscountDOM,parseOffer,eligibility,calculate,extract:scan};
+  const api={version:VERSION,detect,parsePrice,parseOrderDiscount,readOrderDiscountDOM,parseOffer,eligibility,calculate,buildPageNotes,extract:scan};
   if(typeof module!=='undefined'&&module.exports){module.exports=api;return;}
   global.MomoAudit?.stop?.();
   let captures=[], timer=null, observer=null, identity='';
@@ -314,9 +342,11 @@
     identity=next;api.last=r;console.group('MOMO 查核 — '+r.platform.type+'（未核對欄位不是 0）');
     console.table(r.prices||[]);
     if(r.orderDiscount?.shown)console.table([{'項目':'下單再折','促銷價':r.orderDiscount.promotionPrice,'折扣金額':r.orderDiscount.discountAmount,'折扣後價格':r.orderDiscount.priceAfterDiscount,'狀態':r.orderDiscount.status}]);
-    console.log('完整結果',r);console.log('用法：MomoAudit.capture() 保存已展開明細；MomoAudit.json() 匯出；MomoAudit.calculate({...}) 教材試算');console.groupEnd();return r;
+    console.log('完整結果',r);console.log('用法：MomoAudit.capture() 保存已展開明細；MomoAudit.json() 匯出；MomoAudit.calculate({...}) 教材試算');
+    console.log('備註（頁面所見，非已採用優惠）',r.note_momo||'本次未抓到可備註內容');
+    console.groupEnd();return r;
   };
-  api.capture=()=>{const r=api.scan();captures.push({capturedAt:r.capturedAt,productId:r.platform.productId,selectedOptions:r.selectedOptions,orderDiscount:r.orderDiscount,coupons:r.coupons,rewardBranches:r.rewardBranches,details:r.detailTexts});api.captures=captures;console.log('已保存本次可讀明細；仍需核對完整性',captures);return captures;};
+  api.capture=()=>{const r=api.scan();captures.push({capturedAt:r.capturedAt,productId:r.platform.productId,selectedOptions:r.selectedOptions,orderDiscount:r.orderDiscount,coupons:r.coupons,rewardBranches:r.rewardBranches,details:r.detailTexts,note_momo:r.note_momo,noteDetails:r.noteDetails});api.captures=captures;console.log('已保存本次可讀明細；仍需核對完整性',captures);return captures;};
   api.json=()=>JSON.stringify({page:api.last||api.scan(),captures},null,2);
   api.stop=()=>{observer?.disconnect();clearTimeout(timer);};
   api.watch=()=>{api.stop();observer=new MutationObserver(()=>{clearTimeout(timer);timer=setTimeout(()=>api.scan(),1200);});observer.observe(document.body,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['class','aria-pressed','aria-checked','value']});console.log('已開啟變更重掃；MomoAudit.stop() 停止');};
