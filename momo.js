@@ -1,45 +1,27 @@
 (() => {
   'use strict';
 
-  /* ------------------------------------------------------------------
-   * MOMO / MO+ 優惠擷取助手  v1.2.0
-   * 規則來源：《MOMO&MO+ 執行步驟》簡報（22 頁）
-   * 只做「讀取 + 分類 + 判斷可否採用」，不做任何金額計算。
-   *
-   * v1.1.0 修正
-   *   1. 價格：支援「下單再折」展開，取得折扣後價格
-   *   2. 折扣活動：不再強制要求日期區間，改用折扣語句比對
-   *   3. 回饋：逐標籤隔離取列，「登記送」與實體贈品確實濾除
-   * v1.2.0 修正
-   *   4. 「下單再折」實際由最優惠折價券計算 → 讀出券內容，並依折價券排除規則判斷
-   *   5. 區分「頁面明示無可用券」與「折價券 API 讀取失敗」，後者強制人工確認
-   *   6. 每次點開對話框後確實關閉，避免殘留視窗污染後續步驟
-   * v1.3.0 修正
-   *   7. 標籤與金額分屬不同節點時也讀得到（往祖先／兄弟節點找），修正下單再折漏抓
-   *   8. 價格改為「先直接讀，讀不到才點開」，避免無謂觸發會失敗的折價券 API
-   * ------------------------------------------------------------------ */
-
   const APP_ID = 'momo-judgement-helper';
-  const VERSION = '1.3.0';
+  const VERSION = '1.2.2';
 
   if (window.MomoJudgementHelper?.destroy) window.MomoJudgementHelper.destroy();
   else document.getElementById(APP_ID)?.remove();
 
-  /* ========================= 基礎工具 ========================= */
-
   const normalize = (value) => String(value ?? '')
-    .replace(/ /g, ' ')
+    .replace(/\u00a0/g, ' ')
     .replace(/[ \t]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-
   const escapeHtml = (value) => normalize(value).replace(/[&<>'"]/g, (char) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
   })[char]);
-
   const unique = (items) => [...new Set(items.map(normalize).filter(Boolean))];
-  const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-
+  const toNumber = (value) => {
+    const parsed = Number(String(value ?? '').replace(/,/g, '').trim());
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  const roundMoney = (value) => Math.max(0, Math.round(Number(value) || 0));
+  const money = (value) => roundMoney(value).toLocaleString('zh-TW');
   const isVisible = (element) => {
     if (!(element instanceof Element)) return false;
     const style = getComputedStyle(element);
@@ -48,1293 +30,1137 @@
       && Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0;
   };
 
-  async function waitFor(check, timeout = 3000, interval = 80) {
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      const result = check();
-      if (result) return result;
-      await sleep(interval);
-    }
-    return null;
-  }
-
-  const textIn = (element) => normalize(element?.innerText || element?.textContent);
-  const rawTextIn = (element) => normalize(element?.textContent);
-
-  const DIALOG_SELECTOR = '[role="dialog"], .dialog, .popup, .layer, [class*="modal" i]';
-  const openDialogs = () => [...document.querySelectorAll(DIALOG_SELECTOR)].filter(isVisible);
-
-  /** 關閉所有開著的對話框；殘留視窗會擋住後續的「說明」點擊與折價券入口 */
-  async function closeAnyDialog(rounds = 3) {
-    for (let round = 0; round < rounds; round += 1) {
-      const dialogs = openDialogs();
-      if (!dialogs.length) return true;
-      for (const dialog of dialogs) {
-        const close = [...dialog.querySelectorAll('button, a, [role="button"], span, i, svg')]
-          .filter(isVisible)
-          .find((element) => /^(關閉|close|×|✕|✖|X|x)$/i.test(textIn(element))
-            || /close/i.test(element.className || '')
-            || /close/i.test(normalize(element.getAttribute?.('aria-label'))));
-        close?.click();
-      }
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-      await sleep(260);
-    }
-    return openDialogs().length === 0;
-  }
-
-  /**
-   * momo 折價券 API 失敗時（getCouponDetailData 執行失敗 / 取得折價券資料失敗），
-   * 畫面同樣呈現空狀態。若不攔截，「讀取失敗」會被誤判成「無可用券」而漏券。
-   */
-  function installErrorWatch() {
-    const hits = [];
-    const original = console.error;
-    const record = (args) => {
-      const text = args.map((item) => {
-        if (typeof item === 'string') return item;
-        return normalize(item?.message || item?.toString?.());
-      }).join(' ');
-      if (/(getCouponDetailData|取得折價券資料失敗|fetchCouponDetailData|CouponDetail)/i.test(text)) {
-        hits.push(normalize(text).slice(0, 200));
-      }
-    };
-    console.error = function patched(...args) {
-      try { record(args); } catch (_) { /* 監看失敗不影響主流程 */ }
-      return original.apply(console, args);
-    };
-    return {
-      hits,
-      stop() { console.error = original; return unique(hits); },
-    };
-  }
-
-  function numberText(value) {
-    const match = normalize(value).match(/[\d,]+/);
-    return match ? match[0].replace(/,/g, '') : '';
-  }
-
-  /** 可見、且自身不含相同文字子節點的葉區塊，避免同一段文字重複計列 */
-  function leafBlocks(root = document.body, selector = 'li, dd, dt, p, div, span, a, section, tr, td') {
-    const all = [...root.querySelectorAll(selector)].filter(isVisible);
-    return all.filter((element) => {
-      const text = textIn(element);
-      if (!text || text.length < 2 || text.length > 800) return false;
-      const sameChild = [...element.querySelectorAll(selector)]
-        .filter((child) => child !== element && isVisible(child))
-        .some((child) => textIn(child) === text);
-      return !sameChild;
-    });
-  }
-
-  /**
-   * 取「含關鍵字的最小區塊」——同一關鍵字只保留最內層那一個，
-   * 避免大容器把多個標籤列合成一段，造成判斷互相污染。
-   */
-  function smallestBlocksContaining(keyword, maxLength = 300,
-    selector = 'li, div, p, tr, dd, td, span') {
-    const candidates = [...document.querySelectorAll(selector)]
-      .filter(isVisible)
-      .filter((element) => {
-        const text = textIn(element);
-        return text.includes(keyword) && text.length <= maxLength;
-      });
-    return candidates.filter((element) => !candidates
-      .some((other) => other !== element && element.contains(other) && textIn(other).includes(keyword)));
-  }
-
-  /* ========================= 賣場類型 ========================= */
-
-  function detectShopType() {
-    const bodyText = textIn(document.body);
-    const evidence = [];
-
-    const plusBadge = [...document.querySelectorAll('img, span, i, em, div')]
-      .filter(isVisible)
-      .some((element) => /^店\+$/.test(textIn(element))
-        || /^店\+$/.test(normalize(element.getAttribute?.('alt'))));
-    if (plusBadge) evidence.push('頁面有「店+」標記');
-
-    const codeMatch = bodyText.match(/品號\s*[:：]?\s*([A-Za-z0-9]+)/);
-    const goodsCode = codeMatch ? codeMatch[1] : '';
-    if (/^TP\d+/i.test(goodsCode)) evidence.push(`品號 ${goodsCode} 為 TP 開頭`);
-
-    const shopCoupon = /領取商店優惠券/.test(bodyText);
-    if (shopCoupon) evidence.push('頁面有「領取商店優惠券」區塊');
-
-    const crossStore = /跨店/.test(bodyText);
-    if (crossStore) evidence.push('頁面出現「跨店」字樣');
-
-    const flagship = /官方直營|旗艦店/.test(bodyText);
-    if (flagship) evidence.push('頁面有「官方直營／旗艦店」標記');
-
-    let type = '未確定';
-    if (plusBadge || /^TP\d+/i.test(goodsCode) || shopCoupon) type = 'MO+';
-    else if (flagship) type = '旗艦店';
-    else if (goodsCode && /^\d+$/.test(goodsCode)) type = '一般MOMO';
-
-    return { type, goodsCode, evidence };
-  }
-
   function getTitle() {
-    const heading = [...document.querySelectorAll('h1, h2')]
-      .filter(isVisible)
-      .map(textIn)
-      .find((text) => text.length >= 4 && text.length <= 200);
-    return heading || normalize(document.title);
+    const heading = [...document.querySelectorAll('h1, [class*="productName"], [class*="prdName"]')]
+      .find((element) => isVisible(element) && normalize(element.innerText).length > 3);
+    return normalize(heading?.innerText || document.title);
   }
 
-  /* ========================= 價格（步驟 2） ========================= */
-
-  const PRICE_LABELS = ['折扣後價格', '限時折後價', '下單再折', '促銷價', 'momo價', '市售價'];
-
-  function priceLines() {
-    const blocks = leafBlocks(document.body, 'li, p, div, span, td, dd, b, strong');
-    const seen = new Set();
-    const out = [];
-    for (const element of blocks) {
-      const text = textIn(element);
-      if (!text || text.length > 80) continue;
-      const label = PRICE_LABELS.find((item) => text.includes(item));
-      if (!label) continue;
-      if (seen.has(text)) continue;
-      seen.add(text);
-      out.push({ label, text, element });
-    }
-    return out;
+  function firstNumber(text) {
+    const match = normalize(text).match(/[\d,]+(?:\.\d+)?/);
+    return match ? Number(match[0].replace(/,/g, '')) : 0;
   }
 
-  const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-  /**
-   * 讀「標籤 → 金額」。momo 常把標籤與數字拆成不同節點，例如
-   *   <div>下單再折▼</div><div>5,258</div>
-   * 所以除了看節點自身，還要往祖先（合併後的文字）與後續兄弟節點找。
-   * 只取 3 位數以上，且數字後面不可接 % / 折 / 件，避免誤抓折數與件數。
-   */
-  function readLabelledPrice(label, root = document) {
-    const pattern = new RegExp(`${escapeRegExp(label)}[^\\d]{0,14}\\$?\\s*([\\d,]{3,})\\s*(.?)`);
-    const accept = (match) => match && !/[%折件]/.test(match[2] || '');
-
-    const candidates = [...root.querySelectorAll('*')]
-      .filter(isVisible)
-      .filter((element) => {
-        const text = textIn(element);
-        return text.includes(label) && text.length <= 60;
+  function findPriceCandidates() {
+    const found = [];
+    const add = (value, source) => {
+      const price = firstNumber(value);
+      if (price >= 1 && price <= 10000000) found.push({ price, source, raw: normalize(value) });
+    };
+    document.querySelectorAll('meta[property="product:price:amount"], meta[itemprop="price"]')
+      .forEach((element) => add(element.content, '商品價格標籤'));
+    document.querySelectorAll('[itemprop="price"], [class*="salePrice"], [class*="productPrice"], [class*="price"]')
+      .forEach((element) => {
+        if (!isVisible(element)) return;
+        const text = normalize(element.innerText || element.textContent || element.getAttribute('content'));
+        if (text.length <= 50 && /[$＄NT]?\s*[\d,]+/.test(text)) add(text, '頁面價格區');
       });
-    if (!candidates.length) return null;
+    try {
+      document.querySelectorAll('script[type="application/ld+json"]').forEach((script) => {
+        const data = JSON.parse(script.textContent);
+        const visit = (item) => {
+          if (!item || typeof item !== 'object') return;
+          if (item.price) add(item.price, 'JSON-LD');
+          if (item.lowPrice) add(item.lowPrice, 'JSON-LD 最低價');
+          Object.values(item).forEach((value) => {
+            if (value && typeof value === 'object') visit(value);
+          });
+        };
+        visit(data);
+      });
+    } catch (_) { /* 頁面結構化資料不是有效 JSON 時忽略 */ }
+    return found.filter((item, index, all) => all.findIndex((other) => other.price === item.price) === index);
+  }
 
-    const innermost = candidates
-      .filter((element) => !candidates.some((other) => other !== element && element.contains(other)));
+  function visiblePageText() {
+    return normalize(document.body?.innerText || '').slice(0, 80000);
+  }
 
-    for (const element of innermost) {
-      let node = element;
-      for (let level = 0; level <= 4 && node && node !== document.body; level += 1) {
-        // a) 本層文字裡就有「標籤…金額」
-        const text = textIn(node);
-        if (text.length <= 200) {
-          const match = text.match(pattern);
-          if (accept(match)) {
-            return {
-              label,
-              text: normalize(text).slice(0, 80),
-              value: match[1].replace(/,/g, ''),
-              via: level === 0 ? '同節點' : `祖先第${level}層`,
-            };
-          }
-        }
 
-        // b) 同層往後最多 4 個兄弟，取第一個純金額（momo 常把金額放在下一個節點）
-        let sibling = node.nextElementSibling;
-        for (let step = 0; step < 4 && sibling; step += 1) {
-          const siblingText = textIn(sibling);
-          if (siblingText && siblingText.length <= 40) {
-            const numberMatch = siblingText.match(/^\D{0,4}\$?\s*([\d,]{3,})\s*(.?)/);
-            if (numberMatch && !/[%折件]/.test(numberMatch[2] || '')) {
-              return {
-                label,
-                text: `${label} ${siblingText}`,
-                value: numberMatch[1].replace(/,/g, ''),
-                via: level === 0 ? '兄弟節點' : `第${level}層兄弟節點`,
-              };
-            }
-          }
-          sibling = sibling.nextElementSibling;
-        }
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-        node = node.parentElement;
-      }
+  function isSafeAutoClickTarget(element) {
+    if (!(element instanceof Element) || !isVisible(element)) return false;
+    const text = normalize(element.innerText || element.textContent || element.getAttribute('aria-label'));
+    if (!text) return false;
+    if (/(領取|領券|立即領|兌換|加入購物車|直接購買|立即購買|選購|登入|註冊|付款|結帳)/.test(text)) return false;
+    return true;
+  }
+
+  function clickableFrom(element) {
+    if (!(element instanceof Element)) return null;
+    const direct = element.closest('button, a, [role="button"], summary, [tabindex]');
+    if (direct && isSafeAutoClickTarget(direct)) return direct;
+    let node = element;
+    for (let i = 0; node && i < 4; i += 1, node = node.parentElement) {
+      if (!isSafeAutoClickTarget(node)) continue;
+      const style = getComputedStyle(node);
+      if (typeof node.onclick === 'function' || style.cursor === 'pointer') return node;
     }
     return null;
   }
 
-  const hasLabelOnPage = (label) => [...document.querySelectorAll('*')]
-    .filter(isVisible)
-    .some((element) => {
-      const text = textIn(element);
-      return text.includes(label) && text.length <= 60;
+  function findClickableByText(pattern, scope = document) {
+    const nodes = [...scope.querySelectorAll('button, a, [role="button"], summary, span, div, p')];
+    return nodes
+      .filter((element) => isVisible(element))
+      .map((element) => ({
+        element,
+        text: normalize(element.innerText || element.textContent || element.getAttribute('aria-label')),
+      }))
+      .filter(({ text }) => text && text.length <= 90 && pattern.test(text))
+      .sort((a, b) => a.text.length - b.text.length)
+      .map(({ element }) => clickableFrom(element))
+      .find(Boolean) || null;
+  }
+
+  function visibleOverlayRoots() {
+    const selectors = [
+      '[role="dialog"]',
+      '[aria-modal="true"]',
+      '[class*="modal"]',
+      '[class*="dialog"]',
+      '[class*="drawer"]',
+      '[class*="popup"]',
+      '[class*="popper"]',
+      '[class*="coupon"]',
+    ].join(',');
+    return [...document.querySelectorAll(selectors)]
+      .filter((element) => isVisible(element))
+      .filter((element, index, all) => !all.some((other, otherIndex) => (
+        otherIndex !== index && other.contains(element) && normalize(other.innerText).length < 5000
+      )));
+  }
+
+  async function waitForDomChange(beforeText, timeout = 2600) {
+    const start = performance.now();
+    while (performance.now() - start < timeout) {
+      await sleep(120);
+      const nowText = visiblePageText();
+      if (nowText !== beforeText) return true;
+      if (visibleOverlayRoots().length) return true;
+    }
+    return false;
+  }
+
+  const COUPON_TYPE_RE = /(單品折價券|單品券|商品券|品類券|單店抵用券|商店抵用券|店家券|店券|賣場券|商店券)/;
+  const DISCOUNT_VALUE_RE = /(?:折\s*\$?\s*[\d,]+|現折\s*\$?\s*[\d,]+|現抵\s*\$?\s*[\d,]+|折抵\s*\$?\s*[\d,]+|[1-9](?:\.\d+)?\s*折)/;
+
+  function couponCardFrom(element, boundary = document.body) {
+    if (!(element instanceof Element)) return null;
+    let node = element;
+    let candidate = null;
+
+    for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+      if (!(node instanceof Element)) break;
+      const value = normalize(node.innerText || node.textContent);
+
+      if (
+        value.length >= 6
+        && value.length <= 520
+        && COUPON_TYPE_RE.test(value)
+        && DISCOUNT_VALUE_RE.test(value)
+      ) {
+        candidate = node;
+        break;
+      }
+
+      if (node === boundary) break;
+    }
+
+    if (!candidate) return null;
+
+    // MOMO 的「新客專屬優惠／會員／效期／立即領取」有時是 coupon 內容的兄弟節點，
+    // 不在最小的「折$10 + 單店抵用券」節點裡。
+    // 因此往上擴 1~3 層，但只在仍像「單一張券」時擴張，避免把相鄰多張券併成一筆。
+    let best = candidate;
+    let parent = candidate.parentElement;
+
+    for (let depth = 0; parent && depth < 3; depth += 1, parent = parent.parentElement) {
+      if (!(parent instanceof Element)) break;
+      if (parent === boundary) break;
+
+      const value = normalize(parent.innerText || parent.textContent);
+      if (value.length > 700) break;
+
+      const discountMatches = value.match(/(?:折\s*\$?\s*[\d,]+|現折\s*\$?\s*[\d,]+|現抵\s*\$?\s*[\d,]+|折抵\s*\$?\s*[\d,]+|[1-9](?:\.\d+)?\s*折)/g) || [];
+      const couponTypeMatches = value.match(/(?:單品折價券|單品券|商品券|品類券|單店抵用券|商店抵用券|店家券|店券|賣場券|商店券)/g) || [];
+
+      // 出現多組折扣值或多張券種類時，代表已進到多卡片共用容器，不再往上。
+      if (discountMatches.length > 1 || couponTypeMatches.length > 1) break;
+
+      // 只有父層補上「適用限制/狀態」時才擴張。
+      if (/(新客|新戶|首購|首次購買|關注|追蹤|回購|再次購買|會員|專屬|限定|限時|效期|立即領取)/.test(value)) {
+        best = parent;
+      }
+    }
+
+    return best;
+  }
+
+  function collectCouponCards(root) {
+    if (!(root instanceof Element || root instanceof Document)) return [];
+
+    const scope = root instanceof Document ? root.documentElement : root;
+    const candidates = [...scope.querySelectorAll('span, div, li, p, a, button, [role="button"]')]
+      .filter((element) => {
+        if (!isVisible(element)) return false;
+        const value = normalize(element.innerText || element.textContent);
+        return value.length > 0 && value.length <= 180 && COUPON_TYPE_RE.test(value);
+      });
+
+    const cards = [];
+    const seen = new Set();
+
+    candidates.forEach((element) => {
+      const card = couponCardFrom(element, scope);
+      if (!card || seen.has(card)) return;
+      seen.add(card);
+      cards.push(card);
     });
 
-  /** 頁面明示「本帳號無可用折價券」的空狀態 */
-  const NO_COUPON_PATTERN = /(無本商品可使用之折價券|無可使用的折價券|沒有可使用的折價券|查無.{0,6}折價券)/;
-
-  /**
-   * 「下單再折」在 momo 是由「最優惠折價券」算出來的：點它會觸發折價券 API，
-   * 開出「最優惠折價券」視窗。所以這裡要
-   *   a. 讀出視窗內容（券的原文，或「無可用券」空狀態）
-   *   b. 一併比對頁面新增的價格文字
-   *   c. 收尾一定要把視窗關掉，否則污染後續步驟
-   */
-  async function expandOrderDiscount() {
-    const triggers = [...document.querySelectorAll('a, button, span, div, i, em, [role="button"]')]
-      .filter(isVisible)
-      .filter((element) => {
-        const text = textIn(element);
-        return /下單再折/.test(text) && text.length <= 40;
-      })
-      .sort((left, right) => textIn(left).length - textIn(right).length);
-
-    if (!triggers.length) {
-      return {
-        found: false, revealed: [], hidden: [], triggerText: '',
-        dialogText: '', explicitNoCoupon: false, fromCoupon: false,
-      };
-    }
-
-    const trigger = triggers[0];
-    const scope = trigger.closest('li, div, section, dl') || document.body;
-    const priceLike = (text) => /[\d,]{3,}/.test(text) && text.length <= 60;
-    const before = unique([...document.body.querySelectorAll('*')]
-      .filter(isVisible).map(textIn).filter(priceLike));
-    const dialogsBefore = openDialogs().length;
-
-    trigger.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-    trigger.click();
-    await sleep(600);
-
-    const dialogs = openDialogs();
-    const dialog = dialogs.length > dialogsBefore ? dialogs[dialogs.length - 1] : null;
-    const dialogText = dialog ? textIn(dialog) : '';
-    const fromCoupon = /折價券/.test(dialogText);
-    const explicitNoCoupon = NO_COUPON_PATTERN.test(dialogText);
-
-    const after = unique([...document.body.querySelectorAll('*')]
-      .filter(isVisible).map(textIn).filter(priceLike));
-    const revealed = after.filter((text) => !before.includes(text) && /(折|價|\$)/.test(text));
-
-    const hidden = unique([...scope.querySelectorAll('*')]
-      .filter((element) => !isVisible(element))
-      .map(rawTextIn)
-      .filter((text) => text && priceLike(text)));
-
-    await closeAnyDialog();
-
-    return {
-      found: true,
-      triggerText: textIn(trigger),
-      revealed: revealed.slice(0, 12),
-      hidden: hidden.slice(0, 12),
-      dialogText: dialogText.slice(0, 600),
-      fromCoupon,
-      explicitNoCoupon,
-    };
+    // 如果同時抓到父容器與真正卡片，只保留較內層的卡片。
+    return cards.filter((card) => !cards.some((other) => (
+      other !== card && card.contains(other)
+    )));
   }
 
-  async function capturePrice() {
-    const readAll = () => {
-      const map = {};
-      for (const label of PRICE_LABELS) {
-        const reading = readLabelledPrice(label);
-        if (reading) map[label] = reading;
+  function elementTouchesCouponCard(element, couponCards) {
+    if (!(element instanceof Element)) return false;
+    return couponCards.some((card) => (
+      card === element || card.contains(element) || element.contains(card)
+    ));
+  }
+
+  function captureOfferTextsFromRoot(root, sourceLabel = '') {
+    if (!(root instanceof Element)) return [];
+
+    const rootText = normalize(root.innerText || root.textContent);
+    const couponContext = /單品折價券/.test(rootText);
+    const keyword = /(折|券|回饋|加碼|MO幣|mo幣|momo幣|MO點|mo點|momo點|免運|運費|moPro|mopro|跨店|跨館|贈品|滿\s*[\d,]+)/i;
+    const selectors = [
+      'li', 'p', 'button', 'a', 'span', '[role="button"]',
+      '[class*="promotion"]', '[class*="discount"]', '[class*="coupon"]',
+      '[class*="activity"]', '[class*="benefit"]', '[class*="gift"]', '[class*="shipping"]',
+    ].join(',');
+
+    const items = [];
+    const couponCards = collectCouponCards(root);
+
+    // 優惠券以「整張卡片」為最小單位，只抓一次。
+    couponCards.forEach((card) => {
+      let value = normalize(card.innerText || card.textContent);
+      if (value.length < 4 || value.length > 520) return;
+
+      // 單品折價券 popup 有時卡片本身只寫滿額/折扣，分類文字在外層分頁。
+      // 只有缺乏任何券種類時才補上「單品折價券」。
+      if (couponContext && !COUPON_TYPE_RE.test(value)) {
+        value = `單品折價券 ${value}`;
       }
-      return map;
-    };
+      items.push(value);
+    });
 
-    // 先直接讀，不點擊：避免無謂觸發會失敗的折價券 API
-    let readings = readAll();
-    const hasOrderDiscountLabel = hasLabelOnPage('下單再折');
-    let orderDiscount = {
-      found: false, clicked: false, revealed: [], hidden: [], triggerText: '',
-      dialogText: '', explicitNoCoupon: false, fromCoupon: false,
-    };
+    root.querySelectorAll(selectors).forEach((element) => {
+      if (!isVisible(element)) return;
 
-    // 讀不到才展開
-    if (hasOrderDiscountLabel && !readings['下單再折']) {
-      orderDiscount = await expandOrderDiscount();
-      orderDiscount.clicked = true;
-      readings = { ...readAll(), ...readings };
-      if (!readings['下單再折']) {
-        const fromDialog = readLabelledPrice('下單再折', document);
-        if (fromDialog) readings['下單再折'] = fromDialog;
+      // 關鍵修正：
+      // 只要元素在 coupon card 裡、或本身是包住 coupon card 的父容器，
+      // 就不能再獨立變成另一筆「折$10 / 折$18」優惠。
+      if (elementTouchesCouponCard(element, couponCards)) return;
+
+      let value = normalize(element.innerText || element.textContent);
+      if (value.length < 4 || value.length > 280 || !keyword.test(value)) return;
+
+      if (couponContext
+        && !COUPON_TYPE_RE.test(value)
+        && /(?:滿\s*\$?[\d,]+|折\s*\$?\s*[\d,]+|現折|現抵|折抵|[1-9](?:\.\d+)?\s*折)/.test(value)) {
+        value = `單品折價券 ${value}`;
+      }
+
+      items.push(value);
+    });
+
+    // 不把 [來源] 接到優惠文字尾端，避免同一優惠因來源字串不同而無法去重。
+    return unique(items);
+  }
+
+  function closeVisibleOverlay() {
+    const overlays = visibleOverlayRoots();
+    for (const overlay of overlays) {
+      const close = [...overlay.querySelectorAll('button, a, [role="button"], [aria-label]')]
+        .find((element) => {
+          if (!isVisible(element)) return false;
+          const label = normalize(element.getAttribute('aria-label') || element.innerText || element.textContent);
+          return /^(?:關閉|close|×|✕|✖)$/i.test(label);
+        });
+      if (close) {
+        try { close.click(); return true; } catch (_) { /* ignore */ }
       }
     }
+    return false;
+  }
 
-    const lines = priceLines();
-    const merged = [];
-    const seen = new Set();
-    for (const item of lines) {
-      if (seen.has(item.text)) continue;
-      seen.add(item.text);
-      merged.push(item);
-    }
-    // 拆節點讀到的，補進原文列表
-    for (const [label, reading] of Object.entries(readings)) {
-      if (merged.some((item) => item.label === label && /[\d,]{3,}/.test(item.text))) continue;
-      const text = `${reading.text}`;
-      if (seen.has(text)) continue;
-      seen.add(text);
-      merged.push({ label, text });
+  async function clickAndCapture(label, pattern, { clickCouponTab = false } = {}) {
+    const target = findClickableByText(pattern);
+    if (!target) return { label, found: false, clicked: false, changed: false, captured: 0 };
+
+    const before = visiblePageText();
+    try {
+      target.scrollIntoView({ block: 'center', inline: 'nearest' });
+      target.click();
+    } catch (_) {
+      return { label, found: true, clicked: false, changed: false, captured: 0 };
     }
 
-    const finalReading = readings['折扣後價格'] || readings['限時折後價'];
-    const orderReading = readings['下單再折'];
-    const revealedPrice = (orderDiscount.revealed || [])
-      .find((text) => /(折扣後|再折|折後)/.test(text) && /[\d,]{3,}/.test(text))
-      || (orderDiscount.revealed || []).find((text) => /[\d,]{3,}/.test(text));
+    const changed = await waitForDomChange(before);
+    await sleep(180);
 
-    let chosenLabel = '';
-    let chosenText = '';
-    let chosenValue = '';
-    if (finalReading) {
-      ({ label: chosenLabel, text: chosenText, value: chosenValue } = finalReading);
-    } else if (orderReading) {
-      chosenLabel = '下單再折';
-      chosenText = orderReading.text;
-      chosenValue = orderReading.value;
-    } else if (revealedPrice) {
-      chosenLabel = '下單再折（展開後）';
-      chosenText = revealedPrice;
-      chosenValue = numberText(revealedPrice);
-    } else if (readings['促銷價']) {
-      ({ label: chosenLabel, text: chosenText, value: chosenValue } = readings['促銷價']);
-    } else if (readings['momo價']) {
-      ({ label: chosenLabel, text: chosenText, value: chosenValue } = readings['momo價']);
+    if (clickCouponTab) {
+      const roots = visibleOverlayRoots();
+      for (const root of roots) {
+        const tab = findClickableByText(/單品折價券(?:\s*[（(].*至多\s*5\s*張.*[）)])?/, root);
+        if (tab && tab !== target) {
+          try {
+            const tabBefore = visiblePageText();
+            tab.click();
+            await waitForDomChange(tabBefore, 1800);
+            await sleep(120);
+          } catch (_) { /* ignore */ }
+          break;
+        }
+      }
     }
 
-    const rangeMatch = normalize(chosenText).match(/([\d,]+)\s*[~～]\s*([\d,]+)/);
+    const roots = visibleOverlayRoots();
+    let captured = [];
+    roots.forEach((root) => {
+      captured.push(...captureOfferTextsFromRoot(root, label));
+    });
+    captured = unique(captured);
+    if (captured.length) {
+      state.capturedOfferTexts = unique([...(state.capturedOfferTexts || []), ...captured]);
+    }
 
-    // 頁面明示無可用券 → 沒有下單再折價，取促銷價不算漏抓
-    const resolvedByPage = orderDiscount.explicitNoCoupon && !orderReading;
-    const orderDiscountUnresolved = hasOrderDiscountLabel
-      && !finalReading && !orderReading && !revealedPrice && !resolvedByPage;
+    // 盡量把 modal 關掉，避免遮住下一個入口；關不掉也不視為失敗。
+    if (roots.length) {
+      closeVisibleOverlay();
+      await sleep(160);
+    }
 
-    // 下單再折價來自折價券 → 必須先套折價券排除規則才能採用
-    const needCouponRuleCheck = Boolean(orderReading || revealedPrice)
-      && Boolean(chosenLabel && /下單再折/.test(chosenLabel));
+    return { label, found: true, clicked: true, changed, captured: captured.length };
+  }
 
+  async function autoExpandOffers() {
+    if (state.autoExpanding) return state.autoExpandLog || [];
+    state.autoExpanding = true;
+    state.autoExpandLog = [];
+    state.capturedOfferTexts = [];
+
+    const jobs = [
+      ['下單再折', /^下單再折/],
+      ['折扣活動／活動說明', /^(?:折扣活動|活動說明|優惠活動|促銷活動)(?:\s|$|[（(])/],
+      ['可使用的折價券／抵用券', /查看可使用的折價券(?:\s*\/\s*抵用券)?|可使用的折價券\s*\/\s*抵用券/, { clickCouponTab: true }],
+    ];
+
+    for (const [label, pattern, options] of jobs) {
+      try {
+        const result = await clickAndCapture(label, pattern, options || {});
+        state.autoExpandLog.push(result);
+      } catch (error) {
+        state.autoExpandLog.push({
+          label, found: false, clicked: false, changed: false, captured: 0,
+          error: normalize(error?.message || String(error)),
+        });
+      }
+    }
+
+    state.autoExpanding = false;
+    return state.autoExpandLog;
+  }
+
+  function getOrderDiscountInfo() {
+    const triggers = [...document.querySelectorAll('span, button, div')]
+      .filter((element) => isVisible(element) && /^下單再折/.test(normalize(element.innerText || element.textContent)))
+      .sort((a, b) => normalize(a.textContent).length - normalize(b.textContent).length);
+    const trigger = triggers[0] || null;
+    if (!trigger) return { exists: false, expanded: false, price: 0, discount: 0, finalPrice: 0 };
+
+    const priceRoot = trigger.closest('[data-testid="price-main-container"]')
+      || trigger.parentElement?.parentElement?.parentElement;
+    const discountHeader = [...(priceRoot?.querySelectorAll('*') || [])]
+      .find((element) => isVisible(element) && normalize(element.textContent) === '折扣金額');
+    if (!discountHeader) {
+      return { exists: true, expanded: false, price: 0, discount: 0, finalPrice: 0 };
+    }
+
+    const panel = discountHeader.parentElement?.parentElement;
+    const rows = panel ? [...panel.children] : [];
+    const valueCells = rows[1] ? [...rows[1].children] : [];
+    const values = valueCells.map((element) => firstNumber(element.textContent));
     return {
-      lines: merged.map((item) => ({ label: item.label, text: item.text })),
-      readings,
-      orderDiscount,
-      chosenLabel,
-      chosenText,
-      chosenValue: rangeMatch ? '' : (chosenValue || numberText(chosenText)),
-      isRange: Boolean(rangeMatch),
-      rangeText: rangeMatch ? rangeMatch[0] : '',
-      hasOrderDiscountLabel,
-      orderDiscountUnresolved,
-      resolvedByPage,
-      needCouponRuleCheck,
+      exists: true,
+      expanded: values.length >= 3 && values[1] > 0,
+      price: values[0] || 0,
+      discount: values[1] || 0,
+      finalPrice: values[2] || 0,
     };
   }
 
-  /* ========================= 賣場層級檢查 ========================= */
-
-  function getPageExclusions() {
-    const interactives = unique(
-      [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')]
-        .filter(isVisible)
-        .map((element) => element.value || element.innerText || element.textContent)
-        .filter((text) => normalize(text).length <= 80),
-    );
-    const reasons = [];
-    if (interactives.some((text) => /^(售完|已售完|補貨中)$/.test(text))) reasons.push('頁面顯示售完');
-    if (interactives.some((text) => text.includes('有貨通知'))) reasons.push('頁面顯示有貨通知');
-    if (interactives.some((text) => text.includes('前往活動賣場'))) reasons.push('頁面只能前往活動賣場');
-    if (interactives.some((text) => text === '選購')) reasons.push('購買按鈕為選購');
-    return { reasons: unique(reasons), interactives };
-  }
-
-  function getPurchaseLimit() {
-    const text = textIn(document.body);
-    const match = text.match(/每人限購\s*\d+\s*[組件個]?[^。\n]{0,20}/);
-    return match ? normalize(match[0]) : '';
-  }
-
-  function getProductSections() {
-    const text = textIn(document.body);
+  function getPageFacts() {
+    const text = visiblePageText();
+    const prices = findPriceCandidates();
+    const likelyPrice = prices[0]?.price || 0;
+    const goodsInfo = document.querySelector('[data-testid="goods-info"]');
+    const productText = normalize((goodsInfo?.closest('section.flex') || goodsInfo)?.innerText || '');
+    const strongMoPlusSignal = /(?:領取商店優惠券|商店優惠券|問問回應率|商店休假|賣家出貨|店家配送|店家資訊)/i.test(text);
+    const mode = strongMoPlusSignal
+      || /(?:MO\+|mo\+|店\+商品|店家配送|賣家出貨|店家資訊)/i.test(productText)
+      ? 'moplus' : 'momo';
+    const priceRange = /(?:售價|價格)?\s*[$＄]?\s*[\d,]+\s*[~-]\s*[$＄]?\s*[\d,]+/.test(text);
+    const orderDiscount = getOrderDiscountInfo();
+    const priceIncludesPromotion = !orderDiscount.exists
+      && /(售價已折|價格已折|已套用(?:活動|折扣)|折扣後售價)/.test(text.slice(0, 20000));
     return {
-      hasFeature: /商品特色|商品描述|商品介紹/.test(text),
-      hasSpec: /商品規格|規格說明|商品資訊/.test(text),
-    };
-  }
-
-  /* ========================= 原文事實解析（不計算） ========================= */
-
-  function parseFacts(text) {
-    const value = normalize(text).replace(/，/g, ',').replace(/％/g, '%');
-    const threshold = value.match(/(?:單品|訂單|單筆|跨店|每)?\s*滿\s*\$?\s*([\d,]+)\s*(?:元)?/);
-    const pieceThreshold = value.match(/滿\s*([\d,]+)\s*件/);
-    const fixedDiscount = value.match(/(?:再折|現折|折抵|折)\s*\$?\s*([\d,]+)\s*元/);
-    const rateDiscount = value.match(/([\d.]+)\s*折(?:\D|$)/);
-    const coinFixed = value.match(/送\s*(?:momo幣|mo幣)\s*([\d,]+)\s*元?/i)
-      || value.match(/送\s*([\d,]+)\s*(?:momo幣|mo幣)/i);
-    const coinRate = value.match(/(?:momo幣|mo幣)[^。\n]{0,8}?([\d.]+)\s*%/i)
-      || value.match(/([\d.]+)\s*%[^。\n]{0,8}?(?:momo幣|mo幣)/i)
-      || value.match(/刷\s*(?:momo|mo)卡[^。\n]{0,20}?([\d.]+)\s*%/i);
-    const pointRate = value.match(/mo點[^。\n]{0,8}?([\d.]+)\s*%/i)
-      || value.match(/([\d.]+)\s*%[^。\n]{0,8}?mo點/i);
-    const pointFixed = value.match(/送\s*mo點\s*([\d,]+)/i)
-      || value.match(/送\s*([\d,]+)\s*mo點/i);
-    const cap = value.match(/(?:上限|最高折|累加上限|回饋上限)[^。\n]{0,8}?([\d,]+\s*[千萬]?)/);
-    const freeShipThreshold = value.match(/(?:訂單滿|滿)\s*\$?\s*([\d,]+)\s*元?\s*免運/);
-
-    let benefit = '';
-    let unit = '';
-    if (coinFixed) [benefit, unit] = [coinFixed[1].replace(/,/g, ''), 'mo幣'];
-    else if (coinRate) [benefit, unit] = [coinRate[1], '% mo幣'];
-    else if (pointFixed) [benefit, unit] = [pointFixed[1].replace(/,/g, ''), 'mo點'];
-    else if (pointRate) [benefit, unit] = [pointRate[1], '% mo點'];
-    else if (fixedDiscount) [benefit, unit] = [fixedDiscount[1].replace(/,/g, ''), '元'];
-    else if (rateDiscount) [benefit, unit] = [rateDiscount[1], '折'];
-
-    return {
-      threshold: threshold ? threshold[1].replace(/,/g, '') : '',
-      pieceThreshold: pieceThreshold ? pieceThreshold[1].replace(/,/g, '') : '',
-      benefit,
-      unit,
-      cap: cap ? normalize(cap[1]).replace(/,/g, '') : '',
-      freeShipThreshold: freeShipThreshold ? freeShipThreshold[1].replace(/,/g, '') : '',
+      title: getTitle(), url: location.href, mode, likelyPrice, prices, priceRange,
+      priceIncludesPromotion, orderDiscount,
+      isMomo: /momo/i.test(location.hostname) || /momo購物|momo店\+|MO\+/.test(text),
     };
   }
 
   function quotaFrom(text) {
-    const match = normalize(text).match(/(?:限量|限前|名額)\s*[^\d]{0,4}([\d,]+)\s*(人|名|份|筆|組)/);
+    const match = normalize(text).match(/(?:限量|限前|前)\s*([\d,]+)\s*(?:人|名|份|筆|組)/);
     return match ? Number(match[1].replace(/,/g, '')) : null;
   }
 
-  /* ========================= 判斷規則（完全依簡報） ========================= */
-
-  function classifyOffer(offer, shopType) {
-    const own = normalize(`${offer.label || ''} ${offer.summary || ''}`);
-    const text = normalize(`${own} ${offer.detailText || ''}`);
-    const isMoPlus = shopType === 'MO+';
-
-    /* ---- 硬規則 1：登記送一律不採用（只使用免登記的優惠和回饋） ----
-       以「該列自己的標籤 / 原文」判定，不看相鄰列，避免同容器的
-       「免登記」把「登記送」洗掉。 */
-    if (offer.tag === '登記送') {
-      return { status: 'reject', reason: '登記送回饋優惠不採用（只使用免登記的優惠和回饋）' };
-    }
-    const ownNoRegistration = /(免登記|不需登記|無須登記|不用登記)/.test(own);
-    if (!ownNoRegistration && /(登記送|須登記|需登記|限登記|登記回饋|登記領|登記抽|登記活動|立即登記)/.test(own)) {
-      return { status: 'reject', reason: '登記送回饋優惠不採用（只使用免登記的優惠和回饋）' };
-    }
-
-    /* ---- 硬規則 2：非幣、非點數的實體贈品一律忽略 ---- */
-    const giftRow = ['贈品', '滿件贈'].includes(offer.tag) || /贈品/.test(own);
-    const hasCurrency = /(momo幣|mo幣|mo點|momo點)/i.test(text);
-    if (giftRow && !hasCurrency) {
-      return { status: 'ignore', reason: '非幣／非點數的實體贈品，無視物品' };
-    }
-
-    // 會員專屬類（含 MO+ 不可使用的四種）
-    if (/(會員專屬|專屬優惠|指定會員|新客專屬|追蹤商店專屬|回購專屬|限會員)/.test(text)) {
-      return { status: 'reject', reason: '會員專屬／新客專屬／追蹤商店專屬／回購專屬不採用' };
-    }
-    if (offer.couponType === '商店抵用券') {
-      return { status: 'reject', reason: 'MO+ 賣場：商店抵用券不可使用' };
-    }
-
-    // 限定特別支付方式（頁面預設的「刷mo卡享X%」屬預設回饋，不算限定支付）
-    const defaultMoCard = /刷\s*(?:momo|mo)卡[^。\n]{0,24}?[\d.]+\s*%/i.test(own);
-    const paymentRestricted = !defaultMoCard
-      && (/(限|僅限|指定)[^。\n]{0,20}(支付|Pay|pay|PAY|卡別|信用卡|聯名卡)/.test(text)
-        || /刷[^。\n]{0,10}卡(?![^。\n]{0,24}?[\d.]\s*%)/.test(own));
-    if (paymentRestricted) return { status: 'reject', reason: '限定特別支付方式不採用' };
-
-    // 一般MOMO 折價券字樣排除
-    if (offer.kind === 'coupon' && !isMoPlus
-      && /(\d+\s*月|限定|限時|秘密|專屬|獨家|會員)/.test(own)) {
-      return { status: 'reject', reason: '一般MOMO折價券含 月份／限定／限時／秘密／專屬／獨家／會員 不採用' };
-    }
-
-    // 限量規則（MO+ 三種可用券豁免：無論是否限量）
-    const quota = quotaFrom(text);
-    const vagueLimited = /(數量有限|送完為止|贈完為止)/.test(text);
-    const bareLimited = /限量/.test(text) && !Number.isFinite(quota) && !vagueLimited;
-    const underThousand = Number.isFinite(quota) && quota < 1000;
-    const moPlusExempt = isMoPlus && offer.kind === 'coupon'
-      && ['單品折價券', '單店抵用券', '商店免運券'].includes(offer.couponType);
-    if (!moPlusExempt) {
-      if (underThousand) return { status: 'reject', reason: `限量名額 ${quota}，少於 1,000 不採用` };
-      if (bareLimited) return { status: 'reject', reason: '只寫限量、未標註名額，不採用' };
-    }
-
-    // 需人工確認
-    if (offer.mixedTags) {
-      return { status: 'review', reason: `此區塊同時含多個標籤（${offer.mixedTags}），請人工拆分後判斷` };
-    }
-    if (offer.detailRequired && !offer.detailLoaded) {
-      return { status: 'review', reason: '須點開「說明／查看贈品」查看，本次未讀到明細' };
-    }
-    if (offer.kind === 'coupon' && offer.couponType === '未分類折價券') {
-      return { status: 'review', reason: '頁面未明示券別，不自行分類' };
-    }
-    if (offer.kind === 'unknown') {
-      return { status: 'review', reason: '頁面標籤未列於既有規則，請人工確認' };
-    }
-    if (offer.kind === 'coupon' && shopType === '未確定') {
-      return { status: 'review', reason: '賣場類型未確定，券別規則無法套用' };
-    }
-
-    // 可採用
-    if (vagueLimited) return { status: 'usable', reason: '限量但標示「數量有限送完為止」，可使用' };
-    if (Number.isFinite(quota) && quota >= 1000) {
-      return { status: 'usable', reason: `限量名額 ${quota}，不少於 1,000，可使用` };
-    }
-    if (moPlusExempt) return { status: 'usable', reason: 'MO+ 可使用券，符合門檻均可採用（限量也可以）' };
-    return { status: 'usable', reason: '未觸發任何排除條件' };
-  }
-
-  function combineRule(offer, shopType) {
-    if (shopType !== 'MO+') {
-      if (offer.kind === 'discount' || offer.kind === 'coupon') {
-        return '擇優：一般MOMO 折扣活動 & 折價券僅擇 1 種最優惠';
-      }
-    } else {
-      if (offer.couponType === '單品折價券') return '擇優：單品折價券 vs 單店折扣活動（不可疊加）；可與跨店活動併用';
-      if (offer.couponType === '單店抵用券') return '可併用：單店抵用券可與折扣活動併用';
-      if (offer.couponType === '商店免運券') return '可使用：符合條件免運券可用；若無可用則依配送方式最低運費';
-      if (offer.kind === 'discount' && offer.scope === '單店') return '擇優：單店折扣活動 vs 單品折價券（不可疊加）';
-      if (offer.kind === 'discount' && offer.scope === '跨店') return '可併用：跨店活動可與單品折價券併用';
-    }
-    if (offer.kind === 'reward') {
-      if (offer.tag === '免登記') return '擇優：免登記 mo卡回饋 與 預設 3% 擇優';
-      if (offer.tag === '預設') return '基準：可與 滿件贈 / mo幣加碼 疊加；與免登記 mo卡回饋擇優';
-      if (/(滿件贈|加碼)/.test(offer.tag || '')) return '可疊加：滿件贈 mo幣 / mo幣加碼 可與預設 3% 疊加';
-      return '獨立';
-    }
-    if (offer.kind === 'mopro') return '獨立：填 discount_mopro 欄位，不須備註折扣';
-    return '獨立';
-  }
-
-  /* ========================= 擷取：折扣活動 ========================= */
-
-  /** 折扣語句——不要求日期區間（很多頁面沒有日期，例如「滿1件享95折」） */
-  const DISCOUNT_PATTERNS = [
-    /滿\s*\d+\s*件\s*(?:享|打|再)?\s*[\d.]+\s*折/,
-    /滿\s*\$?\s*[\d,]+\s*元?\s*(?:再|現)?折\s*\$?\s*[\d,]+/,
-    /每\s*\$?\s*[\d,]+\s*元?\s*折\s*\$?\s*[\d,]+/,
-    /(?:單品|單店|跨店|全館|本館)[^。\n]{0,14}[\d.]+\s*折/,
-    /(?:跨店|單店)[^。\n]{0,14}折\s*\$?\s*[\d,]+/,
-    /(?:直降|下殺|限時)\s*[\d.]+\s*折/,
-    /滿\s*\$?\s*[\d,]+\s*元?\s*享\s*[\d.]+\s*折/,
-  ];
-  const DATE_RANGE = /\d{1,2}\/\d{1,2}\s*[~～-]\s*\d{1,2}\/\d{1,2}/;
-  const REWARD_TAGS = ['免登記', '登記送', '滿件贈', '贈品', 'mo幣加碼', 'mo點加碼', 'momo幣加碼'];
-
-  function isDiscountRow(text) {
-    if (text.length > 300) return false;
-    if (/(折價券|抵用券|免運券|優惠券)/.test(text)) return false;     // 券歸券，另行處理
-    if (REWARD_TAGS.some((tag) => text.startsWith(tag))) return false; // 回饋列另行處理
-    if (PRICE_LABELS.some((label) => text.startsWith(label))) return false;
-    return DISCOUNT_PATTERNS.some((pattern) => pattern.test(text));
-  }
-
-  function discountRows() {
-    const blocks = leafBlocks(document.body, 'li, p, div, tr, dd, td, a, span');
-    const hits = blocks.filter((element) => isDiscountRow(textIn(element)));
-    // 同一段文字只留最內層
-    const rows = hits.filter((element) => !hits
-      .some((other) => other !== element && element.contains(other)
-        && isDiscountRow(textIn(other))));
-    const seen = new Set();
-    return rows.filter((element) => {
-      const key = textIn(element);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  }
-
-  function discountScope(text) {
-    if (/跨店/.test(text)) return '跨店';
-    if (/(單店|單品|全館|本館|滿\s*\d+\s*件)/.test(text)) return '單店';
-    return '';
-  }
-
-  /** 折扣活動的促銷標籤（例如列旁的「95折」小標） */
-  function promoLabelNear(element) {
-    const container = element.closest('li, div, dd, tr') || element;
-    const candidates = [...container.querySelectorAll('a, span, em, b, i')]
-      .filter(isVisible)
-      .map(textIn)
-      .filter((text) => /^[\d.]+\s*折$/.test(text) || /^滿[\d,]+(元|件)?.{0,8}$/.test(text));
-    return candidates[0] || '';
-  }
-
-  async function openDetail(row) {
-    const trigger = [...row.querySelectorAll('a, button, span, [role="button"], img')]
-      .filter(isVisible)
-      .find((element) => /^[（(]?(說明|活動說明|詳情|查看贈品|查看說明)[）)]?$/.test(textIn(element)));
-    if (!trigger) return { loaded: false, detailText: '' };
-
-    await closeAnyDialog();            // 先確保沒有殘留視窗擋住這次點擊
-    const before = openDialogs().length;
-    trigger.click();
-    const dialog = await waitFor(() => {
-      const nodes = openDialogs();
-      return nodes.length > before ? nodes[nodes.length - 1] : null;
-    }, 3000);
-    if (!dialog) { await closeAnyDialog(); return { loaded: false, detailText: '' }; }
-    await sleep(220);
-    const detailText = textIn(dialog);
-    await closeAnyDialog();            // 收尾一定要關，否則污染下一列
-    return { loaded: true, detailText };
-  }
-
-  async function captureDiscounts(shopType, onProgress) {
-    const rows = discountRows();
-    const offers = [];
-    for (let index = 0; index < rows.length; index += 1) {
-      const row = rows[index];
-      const summary = textIn(row);
-      onProgress(`讀取折扣活動 ${index + 1}/${rows.length}`);
-      const hasDetailLink = /[（(]?說明[）)]?/.test(summary);
-      const detail = hasDetailLink ? await openDetail(row) : { loaded: false, detailText: '' };
-      const scope = discountScope(`${summary} ${detail.detailText}`);
-      const offer = {
-        kind: 'discount',
-        tag: '',
-        scope,
-        category: scope === '跨店' ? '跨店折扣活動' : '單店折扣活動',
-        couponType: '',
-        label: promoLabelNear(row) || (scope ? `${scope}折扣` : '折扣活動'),
-        summary,
-        hasDate: DATE_RANGE.test(summary),
-        detailRequired: hasDetailLink,
-        detailLoaded: detail.loaded,
-        detailText: detail.detailText,
-        order: index + 1,
-        facts: parseFacts(`${summary} ${detail.detailText}`),
-      };
-      Object.assign(offer, classifyOffer(offer, shopType));
-      offer.combine = combineRule(offer, shopType);
-      offers.push(offer);
-    }
-    return offers;
-  }
-
-  /* ========================= 擷取：折價券 ========================= */
-
-  function couponType(text) {
-    const value = normalize(text);
-    if (/單品折價券|單品券/.test(value)) return '單品折價券';
-    if (/單店抵用券|單店券/.test(value)) return '單店抵用券';
-    if (/(商店免運券|免運券)/.test(value)) return '商店免運券';
-    if (/商店抵用券/.test(value)) return '商店抵用券';
-    return '未分類折價券';
-  }
-
-  function needLogin() {
-    return [...document.querySelectorAll('a, button, [role="button"]')]
-      .some((element) => isVisible(element) && /^(登入|會員登入)$/.test(textIn(element)));
-  }
-
-  async function captureCoupons(shopType, onProgress, errorWatch) {
-    const notes = [];
-    const loggedOut = needLogin();
-    if (loggedOut) notes.push('頁面偵測到「登入」，折價券須登入帳戶才能看到，請先登入再重跑助手');
-
-    await closeAnyDialog();
-    const entry = [...document.querySelectorAll('a, button, [role="button"]')]
-      .filter(isVisible)
-      .find((element) => /查看可使用的折價券|查看折價券|領取商店優惠券/.test(textIn(element)));
-    let dialogText = '';
-    if (entry) {
-      onProgress('開啟折價券清單（不領券）');
-      entry.click();
-      const dialog = await waitFor(() => openDialogs().pop() || null, 3500);
-      await sleep(360);
-      dialogText = dialog ? textIn(dialog) : textIn(openDialogs().pop());
-    } else {
-      notes.push('頁面未找到折價券入口');
-    }
-    const explicitNoCoupon = NO_COUPON_PATTERN.test(dialogText);
-
-    // MO+ 橫向券列：捲到底才算讀完
-    const sliders = [...document.querySelectorAll('div, ul')]
-      .filter((element) => isVisible(element) && element.scrollWidth > element.clientWidth + 40);
-    for (const slider of sliders) {
-      for (let step = 0; step < 12 && slider.scrollLeft + slider.clientWidth < slider.scrollWidth; step += 1) {
-        slider.scrollLeft += slider.clientWidth;
-        await sleep(120);
-      }
-    }
-    if (sliders.length) notes.push(`已將 ${sliders.length} 個橫向券列捲到底；若畫面仍有未載入的券，請手動滑到底後重跑`);
-
-    const scope = [...document.querySelectorAll('[role="dialog"], .dialog, .popup, [class*="modal" i]')]
-      .filter(isVisible).pop() || document.body;
-
-    const rows = leafBlocks(scope, 'li, div, tr')
-      .filter((element) => {
-        const text = textIn(element);
-        return /(折價券|抵用券|免運券)/.test(text) && text.length >= 6 && text.length <= 400
-          && !/查看可使用的折價券/.test(text);
-      });
-
-    const seen = new Set();
-    const offers = [];
-    for (const row of rows) {
-      const summary = textIn(row);
-      if (seen.has(summary)) continue;
-      seen.add(summary);
-      const type = couponType(summary);
-      const offer = {
-        kind: 'coupon',
-        tag: '',
-        scope: '',
-        category: type,
-        couponType: type,
-        label: type,
-        summary,
-        detailRequired: false,
-        detailLoaded: true,
-        detailText: '',
-        facts: parseFacts(summary),
-      };
-      Object.assign(offer, classifyOffer(offer, shopType));
-      offer.combine = combineRule(offer, shopType);
-      offers.push(offer);
-    }
-
-    await closeAnyDialog();
-
-    // 空清單有三種成因，必須分開，否則「讀取失敗」會被當成「無券」而漏券
-    const apiErrors = unique(errorWatch?.hits || []);
-    let couponState = 'ok';
-    if (!offers.length) {
-      if (explicitNoCoupon) {
-        couponState = 'none';
-        notes.push('折價券：頁面明示「帳號無本商品可使用之折價券」→ 判定為無可用折價券');
-      } else if (apiErrors.length) {
-        couponState = 'failed';
-        notes.push(`折價券讀取失敗（${apiErrors[0]}），空白不代表無券，必須人工重整頁面確認`);
-      } else if (loggedOut) {
-        couponState = 'logged-out';
-        notes.push('折價券：未登入，無法判定有無可用券，請登入後重跑');
-      } else {
-        couponState = 'unknown';
-        notes.push('未讀到任何折價券項目，且頁面未明示無券，請人工確認');
-      }
-    } else if (apiErrors.length) {
-      notes.push(`折價券 API 曾回報錯誤（${apiErrors[0]}），已讀到的券可能不完整，請人工複查`);
-    }
-
-    return { offers, notes, couponState, explicitNoCoupon, apiErrors, dialogText: dialogText.slice(0, 600) };
-  }
-
-  /* ========================= 擷取：回饋 ========================= */
-
-  /** 頁面預設 mo 卡回饋，寫法多變：刷momo卡消費回饋最高3% / 刷mo卡享3%，回饋上限翻倍至2千 */
-  function defaultMoCardReward() {
-    const blocks = leafBlocks(document.body, 'li, div, p, span, td, a');
-    const hit = blocks.map(textIn)
-      .find((text) => /刷\s*(?:momo|mo)卡[^。\n]{0,30}?[\d.]+\s*%/i.test(text) && text.length <= 120);
-    if (!hit) return null;
-    const offer = {
-      kind: 'reward',
-      tag: '預設',
-      scope: '',
-      category: 'mo幣（預設）',
-      couponType: '',
-      label: '預設',
-      summary: hit,
-      detailRequired: false,
-      detailLoaded: true,
-      detailText: '',
-      facts: parseFacts(hit),
-      status: 'usable',
-      reason: '頁面標示的 momo 卡預設回饋',
-    };
-    offer.combine = combineRule(offer, '');
-    return offer;
-  }
-
-  /** 逐標籤取最小區塊，避免多列黏在一起互相污染判斷 */
-  function rewardRows() {
-    const collected = [];
-    const seen = new Set();
-    for (const tag of REWARD_TAGS) {
-      for (const element of smallestBlocksContaining(tag)) {
-        const text = textIn(element);
-        if (seen.has(text)) continue;
-        seen.add(text);
-        const others = REWARD_TAGS.filter((item) => item !== tag && text.includes(item));
-        collected.push({ tag, element, text, mixedTags: others.length ? [tag, ...others].join('／') : '' });
-      }
-    }
-    return collected;
-  }
-
-  function rewardCategory(text) {
-    const value = normalize(text);
-    if (/mo點/i.test(value)) return 'mo點';               // mo點加碼不可視為 mo幣
-    if (/(momo幣|mo幣)/i.test(value)) return 'mo幣';
-    return '其他回饋';
-  }
-
-  const isMoProMemberPoint = (text) => /moPro/i.test(text) && /mo點/i.test(text);
-  const isSiteWideMemberPoint = (text) => /全站會員/.test(text) && /mo點/i.test(text);
-
-  async function captureRewards(shopType, onProgress) {
-    const offers = [];
-    const seen = new Set();
-
-    const base = defaultMoCardReward();
-    if (base) { offers.push(base); seen.add(base.summary); }
-
-    const rows = rewardRows();
-    for (let index = 0; index < rows.length; index += 1) {
-      const { tag, element, text, mixedTags } = rows[index];
-      if (seen.has(text)) continue;
-      seen.add(text);
-      onProgress(`讀取回饋 ${index + 1}/${rows.length}`);
-
-      const needDetail = ['滿件贈', '贈品'].includes(tag) || /查看贈品/.test(text);
-      const detail = needDetail ? await openDetail(element) : { loaded: false, detailText: '' };
-      const full = `${text} ${detail.detailText}`;
-
-      const offer = {
-        kind: 'reward',
-        tag,
-        mixedTags,
-        scope: '',
-        category: rewardCategory(full),
-        couponType: '',
-        label: tag,
-        summary: text,
-        detailRequired: needDetail,
-        detailLoaded: needDetail ? detail.loaded : true,
-        detailText: detail.detailText,
-        facts: parseFacts(full),
-      };
-      Object.assign(offer, classifyOffer(offer, shopType));
-      offer.combine = combineRule(offer, shopType);
-
-      if (offer.status === 'usable' && isMoProMemberPoint(full)) {
-        offer.status = 'note-only';
-        offer.category = '僅備註';
-        offer.reason = 'moPro 會員送 mo點：僅需備註，不計入公式';
-      } else if (offer.status === 'usable' && isSiteWideMemberPoint(full)) {
-        offer.reason = `${offer.reason}；會員條件為全站會員，可套用並備註`;
-      }
-      offers.push(offer);
-    }
-    return offers;
-  }
-
-  /* ========================= 擷取：moPro 折扣 ========================= */
-
-  function captureMoPro(shopType) {
-    const rows = leafBlocks(document.body, 'li, div, p, tr')
-      .filter((element) => {
-        const text = textIn(element);
-        return /moPro/i.test(text) && /(再省|省\s*[\d,]+\s*元)/.test(text) && text.length <= 200;
-      });
-    const offers = [];
-    const seen = new Set();
-    for (const row of rows) {
-      const summary = textIn(row);
-      if (seen.has(summary) || /mo點/i.test(summary)) continue;
-      seen.add(summary);
-      const amount = summary.match(/(?:再省|省)\s*([\d,]+)\s*元/);
-      const offer = {
-        kind: 'mopro',
-        tag: '',
-        scope: '',
-        category: 'moPro折扣',
-        couponType: '',
-        label: 'moPro',
-        summary,
-        detailRequired: false,
-        detailLoaded: true,
-        detailText: '',
-        facts: { ...parseFacts(summary), benefit: amount ? amount[1].replace(/,/g, '') : '', unit: '元' },
-      };
-      Object.assign(offer, classifyOffer(offer, shopType));
-      offer.combine = combineRule(offer, shopType);
-      offers.push(offer);
-    }
-    return offers;
-  }
-
-  /* ========================= 擷取：運費 ========================= */
-
-  function captureShipping(shopType) {
-    const options = unique(leafBlocks(document.body, 'li, div, p, tr, td')
-      .map(textIn)
-      .filter((text) => /(運費|免運)/.test(text) && text.length <= 200));
-    const needCalculate = shopType === 'MO+';
+  function parseFacts(text) {
+    const value = normalize(text).replace(/，/g, ',').replace(/％/g, '%');
+    const threshold = value.match(/(?:單筆(?:消費)?[^。；，]{0,16}?滿|滿)\s*(?:\$\s*)?([\d,]+)\s*(?:元)?/);
+    const minQty = value.match(/(?:滿|任選|任)\s*([\d,]+)\s*(?:件|入|組|包|盒|罐|瓶|個)/);
+    const fullDiscount = value.match(/([1-9](?:\d|\.\d)?)\s*折(?:\D|$)/);
+    const fixedDiscount = value.match(/(?:現折|現抵|折抵|折|省)\s*(?:\$\s*)?([\d,]+)\s*(?:元)?/);
+    const finalPrice = value.match(/(?:折扣後(?:金額|價格)|券後(?:價|金額)|折後價)\s*(?:\$\s*)?([\d,]+)/);
+    const rate = value.match(/(?:送|回饋|加碼)?\s*([\d.]+)\s*%\s*(?:MO|mo|momo)?\s*(幣|點)/i);
+    const rateAfterUnit = value.match(/(?:送|回饋|加碼)[^。；，]{0,18}?(?:MO|mo|momo)?\s*(幣|點)\s*(?:最高)?\s*([\d.]+)\s*%/i);
+    const fixedReward = value.match(/(?:送|回饋)\s*([\d,]+)\s*(?:MO|mo|momo)?\s*(幣|點)/i);
+    const fixedRewardAfterUnit = value.match(/(?:送|回饋)[^。；，]{0,18}?(?:MO|mo|momo)?\s*(幣|點)\s*([\d,]+)\s*(?:元)?/i);
+    const cap = value.match(/(?:最高|上限)\s*(?:\$\s*)?([\d,]+)\s*(?:元|幣|點)(?!\s*%)/);
+    const shipping = value.match(/(?:運費|配送費)\s*(?:\$\s*)?([\d,]+)/);
+    const moProSave = value.match(/(?:moPro|mopro)[^\n。；]{0,30}?(?:再省|現折|折抵|省)\s*(?:\$\s*)?([\d,]+)/i);
     return {
-      shopType,
-      needCalculate,
-      fieldValue: needCalculate ? '' : '0',
-      note: needCalculate
-        ? 'MO+ 賣場：未符合免運門檻須計算最低運費；運費門檻判定在折扣計算完畢之後'
-        : '一般MOMO／旗艦店：不計運費，shipping_fee_momo 填 0',
-      options,
+      threshold: threshold ? toNumber(threshold[1]) : 0,
+      minQty: minQty ? toNumber(minQty[1]) : 0,
+      fold: fullDiscount
+        ? (Number(fullDiscount[1]) > 10 ? Number(fullDiscount[1]) / 10 : Number(fullDiscount[1]))
+        : 0,
+      fixed: fixedDiscount ? toNumber(fixedDiscount[1]) : 0,
+      finalPrice: finalPrice ? toNumber(finalPrice[1]) : 0,
+      rewardRate: rate ? Number(rate[1]) : (rateAfterUnit ? Number(rateAfterUnit[2]) : 0),
+      rewardUnit: rate ? rate[2]
+        : (rateAfterUnit ? rateAfterUnit[1]
+          : (fixedReward ? fixedReward[2] : (fixedRewardAfterUnit ? fixedRewardAfterUnit[1] : ''))),
+      rewardFixed: fixedReward ? toNumber(fixedReward[1])
+        : (fixedRewardAfterUnit ? toNumber(fixedRewardAfterUnit[2]) : 0),
+      cap: cap ? toNumber(cap[1]) : 0,
+      shipping: shipping ? toNumber(shipping[1]) : 0,
+      moProSave: moProSave ? toNumber(moProSave[1]) : 0,
     };
   }
 
-  /* ========================= UI ========================= */
+  function categoryFrom(text) {
+    const value = normalize(text);
+    if (/moPro|mopro/i.test(value) && /(?:再省|現折|折抵|省)\s*\$?[\d,]+/.test(value)) return 'mopro';
+    if (/moPro|mopro/i.test(value) && /(?:MO|mo|momo)?\s*點/i.test(value)) return 'mopro-note';
+    if (/(免運券|運費券)/.test(value)) return 'shipping-coupon';
+    if (/(?:滿\s*\$?[\d,]+\s*(?:元)?\s*)?免運費|運費\s*\$?\s*0/.test(value)) return 'shipping-rule';
+    if (/(?:MO|mo|momo)\s*點/i.test(value)) return 'mopoint';
+    if (/(?:MO|mo|momo)\s*幣|momo幣/i.test(value)) return 'mocoin';
+    if (/(跨店|跨館)/.test(value) && /(折|抵|券|省)/.test(value)) return 'cross-store';
+    if (/(店家券|店券|賣場券|商店券|單店抵用券|商店抵用券)/.test(value)) return 'store-coupon';
+    if (/(單品券|商品券|品類券)/.test(value)) return 'item-coupon';
+    if (/券/.test(value) && /(?:現折|現抵|折抵|折\s*\$?\s*[\d,]+|\d+(?:\.\d+)?\s*折)/.test(value)) return 'item-coupon';
+    if (/(店家活動|店舖活動|商店活動|賣場活動|單店折扣)/.test(value)) return 'store-activity';
+    if (/(滿\s*\d+\s*(?:件|組|元).{0,20}(?:折|抵|省)|[1-9](?:\.\d+)?\s*折|現折|折扣)/.test(value)) return 'page-discount';
+    return 'other';
+  }
+
+  const CATEGORY_LABELS = {
+    'mopro': 'moPro 價差', 'mopro-note': 'moPro MO點（只備註）',
+    'shipping-coupon': '免運券', 'shipping-rule': '滿額免運', 'mopoint': 'MO點', 'mocoin': 'MO幣',
+    'cross-store': '跨店活動', 'store-coupon': '單店券',
+    'item-coupon': '單品券', 'store-activity': '單店折扣',
+    'page-discount': '頁面折扣活動', 'order-discount': '下單再折',
+    other: '其他／待確認',
+  };
+
+  function classifyOffer(text, category, mode = 'momo') {
+    const value = normalize(text);
+    const facts = parseFacts(value);
+    const quota = quotaFrom(value);
+    const noRegistration = /(免登記|不需登記|無須登記)/.test(value);
+    const registration = !noRegistration && /(須登記|需登記|登記送|登記回饋|限登記|登記抽|登記)/.test(value);
+    const memberOnly = /(會員專屬|會員限定|限會員|會員限時|每月限定|本月限定|神秘|專屬券)/.test(value);
+    const newOrFollow = /(新客|新戶|首購|首次購買|關注|追蹤|回購|再次購買)/.test(value);
+    const specialPayment = /(限|僅限|指定).{0,18}(支付|付款|信用卡|卡別|銀行|LINE Pay|街口|悠遊付)/i.test(value);
+    const soldOut = /(已領完|已用完|已失效|活動結束|不可使用)/.test(value);
+    const underThousand = Number.isFinite(quota) && quota < 1000;
+    const vagueLimited = /限量/.test(value) && !Number.isFinite(quota);
+    const allowedUntilGone = /(?:數量有限|送完為止)/.test(value) && !/(名額|限前)/.test(value);
+    const physicalGift = /(贈品|查看贈品|加贈|送好禮)/.test(value)
+      && !/(?:MO|mo|momo)\s*(?:幣|點)/i.test(value);
+
+    const moPlusItemCouponLimitException = mode === 'moplus' && category === 'item-coupon';
+    const moCardCoinReward = category === 'mocoin' && /(?:MO|mo)\s*卡/.test(value);
+    const momoCobrandPointReward = category === 'mopoint'
+      && /(?:momo\s*)?聯名卡/i.test(value)
+      && /全站會員/.test(value);
+    const regularMomoDiscount = mode === 'momo'
+      && ['page-discount', 'order-discount', 'item-coupon', 'store-coupon', 'store-activity'].includes(category);
+    const regularMomoExcludedLabel = regularMomoDiscount
+      && /(?:\d{1,2}\s*月|限定|限時|秘密|神秘|專屬|獨家|會員)/.test(value);
+
+    if (registration) return { status: 'ignore', reason: '只使用免登記優惠與回饋；登記送不採用' };
+    if (/不適用折價券|不可使用折價券/.test(value)) return { status: 'reject', reason: '頁面明示不適用折價券' };
+    if (/商店抵用券/.test(value) && !/單店抵用券/.test(value)) return { status: 'reject', reason: '商店抵用券不是單店抵用券，不採用' };
+    if (newOrFollow) return { status: 'reject', reason: '新客／新戶／首購／關注／追蹤／回購限定不採用；即使是單店抵用券也排除' };
+    if (memberOnly && !momoCobrandPointReward) return { status: 'reject', reason: '會員／每月／神秘專屬不採用' };
+    if (regularMomoExcludedLabel) return { status: 'reject', reason: '一般 MOMO 折扣含月份／限定／限時／秘密／專屬／獨家／會員，不採用' };
+
+    if (specialPayment && category !== 'mopro-note') {
+      if (moCardCoinReward) {
+        if (!noRegistration) return { status: 'review', reason: 'MO卡回饋只有明示免登記才可自動採用' };
+      } else if (!momoCobrandPointReward) {
+        return { status: 'reject', reason: '一般限定付款方式不採用' };
+      }
+    }
+
+    if (soldOut) return { status: 'reject', reason: '優惠已無法使用' };
+    if (underThousand && !moPlusItemCouponLimitException) {
+      return { status: 'reject', reason: `名額 ${quota}，少於 1,000` };
+    }
+    if (vagueLimited && !allowedUntilGone && !moPlusItemCouponLimitException) {
+      return { status: 'reject', reason: '只寫「限量」但未標名額，不採用' };
+    }
+
+    if (physicalGift) return { status: 'ignore', reason: '實體贈品不影響本助手 8 個數值欄位' };
+    if (category === 'mopro-note') return { status: 'note', reason: 'moPro 會員 MO點只備註，不計入公式' };
+    if (['item-coupon', 'store-coupon', 'cross-store'].includes(category)
+      && !facts.fixed && !facts.fold && !facts.finalPrice) {
+      return { status: 'review', reason: '只看到折價券入口，未讀到實際券額；請展開後重新掃描' };
+    }
+    if (category === 'other') return { status: 'review', reason: '無法自動判斷優惠類型' };
+
+    if (moPlusItemCouponLimitException && (underThousand || vagueLimited)) {
+      return { status: 'usable', reason: 'MO+ 單品折價券符合條件即可使用，無論是否限量' };
+    }
+    if (momoCobrandPointReward) return { status: 'usable', reason: '教材指定的全站會員 MOMO 聯名卡 MO點回饋可採用' };
+    return { status: 'usable', reason: noRegistration ? '免登記，可採用' : '未讀到排除條件' };
+  }
+
+  function scanOfferTexts(mode = 'momo') {
+    const keyword = /(折|券|回饋|加碼|MO幣|mo幣|momo幣|MO點|mo點|momo點|免運|運費|moPro|mopro|跨店|跨館|贈品|滿\s*[\d,]+)/i;
+    const selectors = [
+      'li', 'p', 'button', 'a', 'span', '[role="button"]',
+      '[class*="promotion"]', '[class*="discount"]', '[class*="coupon"]',
+      '[class*="activity"]', '[class*="benefit"]', '[class*="gift"]', '[class*="shipping"]',
+    ].join(',');
+    const texts = [...(state?.capturedOfferTexts || [])];
+    const goodsInfo = document.querySelector('[data-testid="goods-info"]');
+    const goodsTitle = document.querySelector('#goods-detail-goods-title');
+    const productScope = goodsInfo?.closest('section.flex')
+      || goodsInfo?.parentElement
+      || goodsTitle?.closest('article.sidebar-main')
+      || goodsTitle?.parentElement?.parentElement?.parentElement?.parentElement?.parentElement
+      || document;
+    const registrationTexts = [];
+
+    // 頁面上可見的商店/單店/單品券，整張卡片只產生一筆 offer。
+    const couponCards = collectCouponCards(productScope);
+    couponCards.forEach((card) => {
+      const cardText = normalize(card.innerText || card.textContent);
+      if (cardText) texts.push(cardText);
+    });
+    [...productScope.querySelectorAll('div')].forEach((row) => {
+      const directChildren = [...row.children];
+      const registrationLabel = directChildren.find((child) => normalize(child.textContent) === '登記送');
+      const list = directChildren.find((child) => child.tagName === 'UL');
+      if (!registrationLabel || !list) return;
+      list.querySelectorAll('li, a').forEach((element) => {
+        const text = normalize(element.innerText || element.textContent);
+        if (text) registrationTexts.push(text);
+      });
+    });
+    productScope.querySelectorAll('a[href*="func=18"], a[href*="MemberCenter"]')
+      .forEach((element) => {
+        const text = normalize(element.innerText || element.textContent);
+        if (/(?:送|回饋).*(?:MO|mo|momo)\s*(?:幣|點)/i.test(text)) registrationTexts.push(text);
+      });
+    productScope.querySelectorAll(selectors).forEach((element) => {
+      if (!isVisible(element)) return;
+
+      // coupon card 的子元素（折$10、單店抵用券、新客專屬…）
+      // 以及包住多張券的外層容器都不再獨立掃描。
+      if (elementTouchesCouponCard(element, couponCards)) return;
+
+      const text = normalize(element.innerText || element.textContent);
+      if (text.length < 4 || text.length > 260 || !keyword.test(text)) return;
+      texts.push(text);
+    });
+
+    const normalizedTexts = unique(texts);
+
+    // 防守性去重：
+    // 若還有孤立的「折$10 / 折$18」短字串，而完整優惠券卡片已包含同一字串，
+    // 刪除短字串，避免再次被誤分類成 page-discount。
+    const cleanedTexts = normalizedTexts.filter((value) => {
+      const shortDiscountOnly = value.length <= 28
+        && DISCOUNT_VALUE_RE.test(value)
+        && !COUPON_TYPE_RE.test(value);
+
+      if (!shortDiscountOnly) return true;
+
+      return !normalizedTexts.some((other) => (
+        other !== value
+        && COUPON_TYPE_RE.test(other)
+        && other.includes(value)
+      ));
+    });
+
+    const offers = cleanedTexts
+      .slice(0, 80)
+      .map((text, index) => {
+        const category = categoryFrom(text);
+        const isRegistrationOffer = registrationTexts.some((registeredText) => (
+          registeredText === text
+          || (registeredText.length >= 8 && text.includes(registeredText))
+          || (text.length >= 8 && registeredText.includes(text))
+        ));
+        return {
+          id: `offer-${index}`, text, category, registration: isRegistrationOffer, facts: parseFacts(text),
+          ...(isRegistrationOffer
+            ? { status: 'ignore', reason: '位於「登記送」區塊；MOMO／MO+ 都忽略，不計入回饋' }
+            : classifyOffer(text, category, mode)),
+        };
+      });
+
+    const orderDiscount = getOrderDiscountInfo();
+    if (orderDiscount.exists && orderDiscount.expanded) {
+      offers.unshift({
+        id: 'order-discount-detail',
+        text: `下單再折：促銷價 ${orderDiscount.price}／折扣金額 ${orderDiscount.discount}／折扣後價格 ${orderDiscount.finalPrice}`,
+        category: 'order-discount',
+        facts: {
+          threshold: 0, minQty: 0, fold: 0, fixed: orderDiscount.discount,
+          finalPrice: orderDiscount.finalPrice, rewardRate: 0, rewardUnit: '',
+          rewardFixed: 0, cap: 0, shipping: 0, moProSave: 0,
+        },
+        status: 'usable',
+        reason: '已從展開的下單再折表格讀取折扣金額',
+      });
+    } else if (orderDiscount.exists) {
+      offers.unshift({
+        id: 'order-discount-collapsed',
+        text: '頁面顯示「下單再折」，但折扣明細尚未展開',
+        category: 'order-discount',
+        facts: parseFacts(''),
+        status: 'review',
+        reason: '可按助手的「自動展開＋掃描」嘗試展開；若失敗再人工點開後重新掃描',
+      });
+    }
+    return offers;
+  }
+
+  function discountAmount(offer, base, qty) {
+    const facts = offer.facts || parseFacts(offer.text);
+    if (facts.threshold && base < facts.threshold) return 0;
+    if (facts.minQty && qty < facts.minQty) return 0;
+    let amount = 0;
+    if (facts.finalPrice && facts.finalPrice < base) amount = base - facts.finalPrice;
+    else if (facts.fixed) amount = facts.fixed;
+    else if (facts.fold > 0 && facts.fold < 10) amount = roundMoney(base * (1 - facts.fold / 10));
+    if (facts.cap) amount = Math.min(amount, facts.cap);
+    return Math.min(base, roundMoney(amount));
+  }
+
+  function activityNoteFrom(offer) {
+    if (!offer) return '';
+    const text = normalize(offer.text).replace(/\s+/g, ' ');
+    const condition = text.match(/((?:滿|任選|任)\s*[\d,]+\s*(?:件|入|組|包|盒|罐|瓶|個|元)[^。；，/]{0,28}?(?:[1-9](?:\d|\.\d)?\s*折|折\s*\$?\s*[\d,]+\s*元?|現折\s*\$?\s*[\d,]+\s*元?))/);
+    if (condition) return `折扣活動(${normalize(condition[1])})`;
+    const shortDiscount = text.match(/([^。；，/\n]{0,28}(?:[1-9](?:\d|\.\d)?\s*折|現折\s*\$?\s*[\d,]+\s*元?))/);
+    return shortDiscount ? `折扣活動(${normalize(shortDiscount[1])})` : '';
+  }
+
+  const state = {
+    facts: getPageFacts(), offers: [], output: null, collapsed: false,
+    capturedOfferTexts: [], autoExpandLog: [], autoExpanding: false,
+  };
+  state.offers = scanOfferTexts(state.facts.mode);
 
   const host = document.createElement('div');
   host.id = APP_ID;
+  host.style.cssText = 'position:fixed;top:16px;right:16px;z-index:2147483647;font-family:Arial,"Microsoft JhengHei",sans-serif;';
   document.documentElement.appendChild(host);
   const shadow = host.attachShadow({ mode: 'open' });
 
   shadow.innerHTML = `
     <style>
-      :host { all: initial; } * { box-sizing: border-box; }
-      .panel { position: fixed; top: 12px; right: 12px; z-index: 2147483647; width: 520px;
-        max-width: calc(100vw - 24px); max-height: calc(100vh - 24px); overflow: auto;
-        color: #17202a; background: #fff; border: 1px solid #cbd5e1; border-radius: 12px;
-        box-shadow: 0 18px 50px rgba(15,23,42,.28); font: 13px/1.45 system-ui, sans-serif; }
-      header { position: sticky; top: 0; z-index: 2; display: flex; align-items: center;
-        justify-content: space-between; gap: 8px; padding: 11px 12px; color: #fff; background: #d6006e;
-        cursor: move; user-select: none; touch-action: none; }
-      header strong { font-size: 15px; }
-      header button { width: 28px; height: 28px; padding: 0; color: #fff; background: transparent;
-        border: 1px solid rgba(255,255,255,.5); border-radius: 6px; cursor: pointer; }
-      main { padding: 12px; }
-      section { margin: 0 0 12px; padding: 10px; border: 1px solid #e2e8f0; border-radius: 9px; }
-      h2 { margin: 0 0 8px; font-size: 14px; } p { margin: 6px 0; }
-      .muted { color: #64748b; font-size: 12px; }
-      .status { padding: 8px; border-radius: 7px; font-weight: 700; overflow-wrap: anywhere; margin-bottom: 6px; }
-      .ok { color: #166534; background: #dcfce7; } .bad { color: #991b1b; background: #fee2e2; }
-      .warn { color: #92400e; background: #fef3c7; } .info { color: #1e3a8a; background: #dbeafe; }
-      .facts { display: grid; grid-template-columns: 96px 1fr; gap: 4px 8px; }
-      .facts b { overflow-wrap: anywhere; }
-      label { display: block; margin-top: 8px; color: #334155; font-size: 12px; }
-      textarea { width: 100%; min-height: 54px; margin-top: 3px; padding: 7px 8px; resize: vertical;
-        color: #111827; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; font: inherit; }
-      button.action { padding: 8px 11px; color: #fff; background: #d6006e; border: 0;
-        border-radius: 6px; cursor: pointer; font: inherit; font-weight: 700; }
-      button.action:disabled { opacity: .55; cursor: wait; }
-      button.secondary { color: #334155; background: #f1f5f9; }
-      .actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 9px 0 12px; }
-      details { margin-top: 7px; } summary { cursor: pointer; font-weight: 700; }
-      ul { margin: 6px 0 0; padding-left: 18px; } li { margin: 7px 0; overflow-wrap: anywhere; }
-      .usable { color: #166534; } .reject { color: #b42318; } .review { color: #92400e; }
-      .ignore { color: #64748b; } .noteonly { color: #6d28d9; }
-      .evidence { color: #475569; font-size: 12px; } .hidden { display: none !important; }
+      *{box-sizing:border-box} .panel{width:430px;max-height:calc(100vh - 32px);background:#fff;color:#252525;border:1px solid #d6d6d6;border-radius:14px;box-shadow:0 14px 42px #0004;overflow:hidden;font-size:13px}
+      .head{display:flex;align-items:center;gap:9px;padding:11px 12px;background:linear-gradient(135deg,#8f2168,#d22e7a);color:#fff;cursor:move;user-select:none}.head strong{font-size:15px}.head small{opacity:.85}.spacer{flex:1}.icon{border:0;background:#ffffff26;color:#fff;border-radius:7px;width:29px;height:27px;cursor:pointer;font-weight:700}
+      .body{max-height:calc(100vh - 82px);overflow:auto;padding:12px;background:#f8f6f8}.panel.collapsed{width:300px}.panel.collapsed .body{display:none}
+      .notice{padding:9px 10px;border-radius:9px;margin-bottom:10px;line-height:1.45}.warn{background:#fff1d9;color:#784600;border:1px solid #f2d19a}.bad{background:#fde6e8;color:#922733;border:1px solid #efb9bf}.good{background:#e8f6ed;color:#17693a;border:1px solid #b9dec7}
+      .section{background:#fff;border:1px solid #e3dfe3;border-radius:10px;padding:10px;margin:9px 0}.section h3{font-size:14px;margin:0 0 8px;color:#7d1c59}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.field label{display:block;font-size:11px;color:#666;margin:0 0 3px}.field input,.field select,textarea{width:100%;border:1px solid #ccc;border-radius:7px;padding:7px;background:#fff;font:inherit}.check{display:flex;gap:6px;align-items:flex-start;margin-top:8px;line-height:1.35}.check input{margin-top:2px}
+      .buttons{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin:9px 0}.buttons.three{grid-template-columns:1fr 1fr 1fr}.btn{border:0;border-radius:8px;padding:9px;cursor:pointer;font-weight:700}.primary{background:#a92570;color:#fff}.secondary{background:#ebe3e9;color:#6c1b50}.copy{background:#205c45;color:#fff}
+      .offer{border-top:1px solid #eee;padding:8px 0}.offer:first-child{border-top:0}.offer-top{display:flex;align-items:center;gap:6px}.tag{font-size:10px;padding:2px 5px;border-radius:9px;background:#eee;white-space:nowrap}.usable{background:#dff3e7;color:#17643a}.reject{background:#f8dfe2;color:#912532}.review{background:#fff0cd;color:#805000}.note,.ignore{background:#e6ebf5;color:#3c4f75}.offer-text{font-size:12px;line-height:1.4;margin-top:4px;max-height:52px;overflow:auto}.reason{font-size:11px;color:#777;margin-top:3px}.results{width:100%;border-collapse:collapse}.results td{padding:6px;border-bottom:1px solid #eee}.results td:first-child{color:#666}.results td:nth-child(2){font-weight:700;text-align:right}.results td:last-child{width:55px;text-align:right}.mini{font-size:11px;color:#777;line-height:1.45}.hidden{display:none}
     </style>
     <div class="panel">
-      <header title="按住拖曳；雙擊回到右上角">
-        <strong>MOMO / MO+ 優惠擷取助手 v${VERSION}</strong>
-        <button id="close" title="關閉">×</button>
-      </header>
-      <main>
-        <section id="pageSection"></section>
-        <div id="progress" class="status info">尚未擷取。按下「自動抓取優惠」。</div>
-        <div class="actions">
-          <button class="action" id="capture">自動抓取優惠</button>
-          <button class="action secondary" id="copyUsable" disabled>複製可填資料</button>
-          <button class="action secondary" id="copyAll" disabled>複製完整判斷</button>
+      <div class="head"><strong>MOMO 對標助手</strong><small>v${VERSION}</small><span class="spacer"></span><button class="icon" id="collapse" title="收合">−</button><button class="icon" id="close" title="關閉">×</button></div>
+      <div class="body">
+        <div id="siteNotice"></div>
+        <div class="section">
+          <h3>1. 商品與價格</h3>
+          <div class="mini" id="titleText"></div>
+          <label class="check"><input id="commonPassed" type="checkbox"><span>已依「商品對標決策圖」通過共同主流程與特殊品類例外</span></label>
+          <div class="grid" style="margin-top:8px">
+            <div class="field"><label>賣場類型</label><select id="mode"><option value="momo">一般 MOMO</option><option value="moplus">MO+</option></select></div>
+            <div class="field"><label>實際單價</label><input id="unitPrice" inputmode="numeric" placeholder="請確認頁面價格"></div>
+            <div class="field"><label>qty_momo 下單組數</label><input id="qty" type="number" min="1" step="1" value="1"></div>
+            <div class="field"><label>MO+ 運費（無免運時）</label><input id="shipping" inputmode="numeric" value="0"></div>
+          </div>
+          <label class="check"><input id="priceIncluded" type="checkbox"><span>頁面價格已套用上方折扣活動，不要重複計入 discount_momo</span></label>
+          <label class="check"><input id="limitOne" type="checkbox"><span>頁面顯示限購 1 組／只能下單一次</span></label>
         </div>
-        <section id="filledSection" class="hidden">
-          <h2>符合規則，可填入表單欄位</h2>
-          <label>price_momo（價格）<textarea id="outPrice" readonly></textarea></label>
-          <label>discount_momo（折扣：折扣活動／折價券）<textarea id="outDiscount" readonly></textarea></label>
-          <label>discount_mopro（moPro 折扣）<textarea id="outMoPro" readonly></textarea></label>
-          <label>coinback_momo（mo幣回饋）<textarea id="outCoin" readonly></textarea></label>
-          <label>Pointsback_platform_momo（mo點回饋）<textarea id="outPoint" readonly></textarea></label>
-          <label>shipping_fee_momo（運費）<textarea id="outShip" readonly></textarea></label>
-          <label>note_momo（備註：任何優惠 &amp; 折扣）<textarea id="outNote" readonly></textarea></label>
-          <p class="muted">保留網頁原文與門檻／折數，不做任何金額計算、不挑最優惠。已排除的項目不會進入備註。</p>
-        </section>
-        <section id="decisionSection" class="hidden"></section>
-      </main>
+        <div class="section">
+          <h3>2. 自動掃描優惠</h3>
+          <div class="mini">「自動展開＋掃描」只會嘗試點開下單再折、折扣活動／活動說明、查看可使用的折價券／抵用券與單品折價券分頁；不會領券、登入、選規格或購買。</div>
+          <div class="buttons three"><button class="btn secondary" id="autoScan">自動展開＋掃描</button><button class="btn secondary" id="rescan">只重新掃描</button><button class="btn primary" id="calculate">計算 8 欄位</button></div>
+          <div id="autoStatus" class="mini"></div>
+          <div id="offerSummary" class="mini"></div>
+          <details><summary style="cursor:pointer;margin-top:7px">查看掃描項目</summary><div id="offers"></div></details>
+        </div>
+        <div class="section hidden" id="resultSection">
+          <h3>3. 建議填寫</h3>
+          <table class="results" id="results"></table>
+          <div class="buttons"><button class="btn copy" id="copyValues">複製一列數值</button><button class="btn secondary" id="copyDetail">複製欄位明細</button></div>
+          <div id="audit" class="mini"></div>
+        </div>
+      </div>
     </div>`;
 
   const $ = (selector) => shadow.querySelector(selector);
-  let latest = null;
-  let busy = false;
+  const panel = $('.panel');
 
-  function setProgress(message, type = 'info') {
-    $('#progress').className = `status ${type}`;
-    $('#progress').textContent = message;
+  function renderFacts() {
+    $('#titleText').textContent = state.facts.title || '未讀到商品名稱';
+    $('#mode').value = state.facts.mode;
+    $('#unitPrice').value = state.facts.likelyPrice || '';
+    $('#priceIncluded').checked = state.facts.priceIncludesPromotion;
+    const messages = [];
+    if (!state.facts.isMomo) messages.push('目前頁面不像 MOMO 商品頁，請確認網址。');
+    if (!state.facts.likelyPrice) messages.push('未可靠讀到售價，請手動填入「實際單價」。');
+    if (state.facts.priceRange) messages.push('頁面有價格區間；請先選妥正確規格，再手動確認單價。');
+    if (state.facts.orderDiscount?.exists && !state.facts.orderDiscount.expanded) {
+      messages.push('偵測到「下單再折」但尚未讀到明細；可先按「自動展開＋掃描」。');
+    }
+    $('#siteNotice').innerHTML = messages.length
+      ? `<div class="notice warn">${messages.map(escapeHtml).join('<br>')}</div>`
+      : '<div class="notice good">已讀取頁面基本資料；價格與規格仍請人工確認一次。</div>';
   }
 
-  function renderPageHeader(base) {
-    const { shop, title, price, exclusion, limit, sections } = base;
-    const domain = /momoshop\.com\.tw$/i.test(location.hostname)
-      ? '' : '<div class="status warn">目前不是 momoshop 網域</div>';
-    const pageStatus = exclusion.reasons.length
-      ? `<div class="status bad">賣場不採用：${escapeHtml(exclusion.reasons.join('、'))}</div>`
-      : '<div class="status ok">未偵測到賣場排除條件（售完／有貨通知／前往活動賣場／選購）</div>';
-    const shopStatus = shop.type === '未確定'
-      ? '<div class="status warn">賣場類型未確定，運費與券別規則請人工判斷</div>'
-      : `<div class="status info">賣場類型：${escapeHtml(shop.type)}</div>`;
-    const priceWarn = price?.isRange
-      ? `<div class="status warn">價格為區間 ${escapeHtml(price.rangeText)}，須點選品項後重抓</div>` : '';
-    const orderWarn = price?.orderDiscountUnresolved
-      ? '<div class="status warn">頁面有「下單再折」，但展開後仍讀不到折扣後價格，請人工點開確認</div>' : '';
-    const checkStatus = (sections.hasFeature && sections.hasSpec)
-      ? '<div class="status info">頁面有商品特色與商品規格區塊，請人工查看</div>'
-      : '<div class="status warn">未同時找到商品特色／商品規格區塊，請人工確認</div>';
-
-    $('#pageSection').innerHTML = `<h2>商品頁</h2>${domain}${shopStatus}${pageStatus}${priceWarn}${orderWarn}${checkStatus}
-      <div class="facts">
-        <span>商品</span><b>${escapeHtml(title)}</b>
-        <span>品號</span><b>${escapeHtml(shop.goodsCode) || '未讀到'}</b>
-        <span>類型依據</span><b>${escapeHtml(shop.evidence.join('；')) || '無'}</b>
-        <span>價格各列</span><b>${escapeHtml((price?.lines || []).map((line) => line.text).join('｜')) || '未讀到'}</b>
-        <span>採用價格</span><b>${escapeHtml(price?.chosenLabel ? `${price.chosenLabel}：${price.chosenText}` : '未確定')}</b>
-        <span>下單再折</span><b>${(() => {
-    if (!price) return '尚未讀取';
-    const reading = price.readings?.['下單再折'];
-    if (reading) return escapeHtml(`${reading.value}（${reading.text}，來源：${reading.via}）`);
-    if (!price.hasOrderDiscountLabel) return '頁面無此標示';
-    if (price.resolvedByPage) return '由最優惠折價券計算；頁面明示無可用券 → 無下單再折價';
-    const extra = [...(price.orderDiscount?.revealed || []), ...(price.orderDiscount?.hidden || [])].join('｜');
-    return escapeHtml(extra || price.orderDiscount?.dialogText || '有標示但讀不到數字，請人工確認');
-  })()}</b>
-        <span>限購</span><b>${escapeHtml(limit) || '未標示'}</b>
-      </div>`;
+  function renderOffers() {
+    const counts = state.offers.reduce((acc, offer) => {
+      acc[offer.status] = (acc[offer.status] || 0) + 1;
+      return acc;
+    }, {});
+    $('#offerSummary').textContent = `共掃描 ${state.offers.length} 項：可用 ${counts.usable || 0}、忽略 ${counts.ignore || 0}、只備註 ${counts.note || 0}、排除 ${counts.reject || 0}、待確認 ${counts.review || 0}。`;
+    $('#offers').innerHTML = state.offers.length ? state.offers.map((offer) => `
+      <div class="offer">
+        <div class="offer-top"><span class="tag ${offer.status}">${escapeHtml(offer.status === 'usable' ? '可用' : offer.status === 'reject' ? '排除' : offer.status === 'note' ? '備註' : offer.status === 'ignore' ? '忽略' : '待確認')}</span><span class="tag">${escapeHtml(CATEGORY_LABELS[offer.category])}</span></div>
+        <div class="offer-text">${escapeHtml(offer.text)}</div><div class="reason">${escapeHtml(offer.reason)}</div>
+      </div>`).join('') : '<div class="mini" style="margin-top:8px">未掃描到可辨識的優惠文字。請先展開「活動說明／優惠券／查看贈品」後重新掃描。</div>';
   }
 
-  function outputLine(offer) {
-    const facts = offer.facts || {};
-    const extras = [
-      facts.threshold ? `門檻=${facts.threshold}` : '',
-      facts.pieceThreshold ? `件數門檻=${facts.pieceThreshold}` : '',
-      facts.benefit ? `優惠=${facts.benefit}${facts.unit}` : '',
-      facts.cap ? `上限=${facts.cap}` : '',
-      facts.freeShipThreshold ? `免運門檻=${facts.freeShipThreshold}` : '',
-      offer.scope ? `範圍=${offer.scope}` : '',
-      offer.order ? `頁面順序=${offer.order}` : '',
-      offer.combine ? `關係=${offer.combine}` : '',
-    ].filter(Boolean);
-    return `${offer.label ? `[${offer.label}] ` : ''}${offer.summary}${extras.length ? `｜${extras.join('｜')}` : ''}`;
+
+  function renderAutoStatus() {
+    const node = $('#autoStatus');
+    if (!node) return;
+    if (state.autoExpanding) {
+      node.textContent = '正在嘗試展開優惠內容並等待 MOMO 載入…';
+      return;
+    }
+    if (!state.autoExpandLog?.length) {
+      node.textContent = '';
+      return;
+    }
+    node.textContent = state.autoExpandLog.map((item) => {
+      if (!item.found) return `${item.label}：找不到入口`;
+      if (!item.clicked) return `${item.label}：找到但無法點擊`;
+      const capture = item.captured ? `，擷取 ${item.captured} 段文字` : '';
+      return `${item.label}：已點擊${item.changed ? '並偵測到頁面變化' : ''}${capture}`;
+    }).join(' ｜ ');
   }
 
-  function renderOfferList(items, cssClass) {
-    if (!items.length) return '<p class="muted">無</p>';
-    return `<ul>${items.map((offer) => `<li class="${cssClass}">
-      <b>${escapeHtml(offer.category)}｜${escapeHtml(offer.reason)}</b><br>
-      ${escapeHtml(offer.label ? `[${offer.label}] ${offer.summary}` : offer.summary)}
-      ${offer.combine ? `<div class="evidence">關係：${escapeHtml(offer.combine)}</div>` : ''}
-      ${offer.detailText ? `<div class="evidence">明細：${escapeHtml(offer.detailText.slice(0, 220))}</div>` : ''}
-    </li>`).join('')}</ul>`;
-  }
+  async function autoExpandAndRescan() {
+    if (state.autoExpanding) return;
+    const button = $('#autoScan');
+    if (button) button.disabled = true;
+    const statusNode = $('#autoStatus');
+    if (statusNode) statusNode.textContent = '正在嘗試展開優惠內容並等待 MOMO 載入…';
 
-  function renderResults(result) {
-    const { offers } = result;
-    const usable = offers.filter((offer) => offer.status === 'usable');
-    const review = offers.filter((offer) => offer.status === 'review');
-    const rejected = offers.filter((offer) => offer.status === 'reject');
-    const ignored = offers.filter((offer) => offer.status === 'ignore');
-    const noteOnly = offers.filter((offer) => offer.status === 'note-only');
-    const byKind = (predicate) => usable.filter(predicate).map(outputLine).join('\n');
-
-    $('#outPrice').value = [
-      result.price.chosenLabel ? `${result.price.chosenLabel}：${result.price.chosenText}` : '',
-      result.price.chosenValue ? `數值：${result.price.chosenValue}` : '',
-      ...result.price.lines.filter((line) => line.text !== result.price.chosenText)
-        .map((line) => `（參考）${line.text}`),
-      result.limit ? `限購：${result.limit}` : '',
-    ].filter(Boolean).join('\n');
-
-    $('#outDiscount').value = byKind((offer) => offer.kind === 'discount'
-      || (offer.kind === 'coupon' && offer.couponType !== '商店免運券'));
-    $('#outMoPro').value = byKind((offer) => offer.kind === 'mopro');
-    $('#outCoin').value = byKind((offer) => offer.kind === 'reward' && /mo幣/.test(offer.category));
-    $('#outPoint').value = byKind((offer) => offer.kind === 'reward' && /mo點/.test(offer.category));
-    $('#outShip').value = [
-      result.shipping.needCalculate ? '需計算最低運費' : `填 ${result.shipping.fieldValue}`,
-      result.shipping.note,
-      ...usable.filter((offer) => offer.couponType === '商店免運券').map(outputLine),
-      ...result.shipping.options.map((text) => `配送方式原文：${text}`),
-    ].filter(Boolean).join('\n');
-
-    // 備註只收「可填入」與「僅備註」；不採用／忽略一律不進備註
-    $('#outNote').value = [...usable, ...noteOnly]
-      .filter((offer) => offer.kind !== 'reward' || offer.tag !== '預設' || true)
-      .map((offer) => `${offer.label ? `[${offer.label}] ` : ''}${offer.summary}`)
-      .concat(result.limit ? [`限購：${result.limit}`] : [])
-      .join('\n');
-
-    $('#filledSection').classList.remove('hidden');
-    const couponBanner = {
-      failed: '<div class="status bad">折價券讀取失敗：清單空白不代表無券，請重整頁面後重跑，或人工開啟折價券確認</div>',
-      none: '<div class="status ok">折價券：頁面明示帳號無本商品可使用之折價券 → 判定為無可用折價券</div>',
-      'logged-out': '<div class="status warn">折價券：尚未登入，無法判定有無可用券</div>',
-      unknown: '<div class="status warn">折價券：未讀到項目且頁面未明示無券，請人工確認</div>',
-    }[result.couponState] || '';
-
-    $('#decisionSection').innerHTML = `<h2>逐項判斷</h2>
-      ${couponBanner}
-      ${result.notes.map((note) => `<div class="status warn">${escapeHtml(note)}</div>`).join('')}
-      <details open><summary class="usable">可填入（${usable.length}）</summary>${renderOfferList(usable, 'usable')}</details>
-      <details open><summary class="noteonly">僅備註不計入（${noteOnly.length}）</summary>${renderOfferList(noteOnly, 'noteonly')}</details>
-      <details open><summary class="review">需人工確認（${review.length}）</summary>${renderOfferList(review, 'review')}</details>
-      <details><summary class="reject">不採用（${rejected.length}）</summary>${renderOfferList(rejected, 'reject')}</details>
-      <details><summary class="ignore">忽略（${ignored.length}）</summary>${renderOfferList(ignored, 'ignore')}</details>`;
-    $('#decisionSection').classList.remove('hidden');
-    $('#copyUsable').disabled = usable.length === 0;
-    $('#copyAll').disabled = offers.length === 0;
-  }
-
-  function toTsv(result, onlyUsable) {
-    const rows = onlyUsable
-      ? result.offers.filter((offer) => ['usable', 'note-only'].includes(offer.status))
-      : result.offers;
-    const header = ['網址', '商品', '品號', '賣場類型', '採用價格', '價格各列', '限購', '判定', '類別',
-      '標籤', '範圍', '券別', '原文', '門檻', '件數門檻', '優惠值', '單位', '上限', '免運門檻',
-      '疊加關係', '頁面順序', '明細', '理由'];
-    const clean = (value) => normalize(value).replace(/[\t\r\n]+/g, ' ');
-    const data = rows.map((offer) => [
-      location.href, result.title, result.shop.goodsCode, result.shop.type,
-      `${result.price.chosenLabel}:${result.price.chosenText}`,
-      result.price.lines.map((line) => line.text).join(' / '), result.limit,
-      offer.status, offer.category, offer.tag, offer.scope, offer.couponType, offer.summary,
-      offer.facts?.threshold, offer.facts?.pieceThreshold, offer.facts?.benefit, offer.facts?.unit,
-      offer.facts?.cap, offer.facts?.freeShipThreshold, offer.combine, offer.order,
-      (offer.detailText || '').slice(0, 300), offer.reason,
-    ].map(clean).join('\t'));
-    return [header.join('\t'), ...data].join('\n');
-  }
-
-  async function copyText(text, button) {
-    const original = button.textContent;
     try {
-      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
-      else {
-        const textarea = document.createElement('textarea');
-        textarea.value = text; textarea.style.position = 'fixed'; textarea.style.opacity = '0';
-        document.body.appendChild(textarea); textarea.select(); document.execCommand('copy'); textarea.remove();
+      await autoExpandOffers();
+      state.facts = getPageFacts();
+
+      // 尊重使用者目前手動選擇的賣場類型；只有第一次未變更時才採自動偵測。
+      const selectedMode = $('#mode')?.value;
+      if (selectedMode === 'momo' || selectedMode === 'moplus') {
+        state.facts.mode = selectedMode;
       }
-      button.textContent = '已複製';
-    } catch (error) {
-      console.error('[MOMO 助手] 複製失敗', error);
-      button.textContent = '複製失敗';
-    } finally { setTimeout(() => { button.textContent = original; }, 1200); }
-  }
 
-  async function capture() {
-    if (busy) return latest;
-    busy = true;
-    $('#capture').disabled = true; $('#copyUsable').disabled = true; $('#copyAll').disabled = true;
-    const errorWatch = installErrorWatch();
-    try {
-      const shop = detectShopType();
-      const title = getTitle();
-      const exclusion = getPageExclusions();
-      const limit = getPurchaseLimit();
-      const sections = getProductSections();
-      renderPageHeader({ shop, title, price: null, exclusion, limit, sections });
-
-      setProgress('讀取價格（含展開「下單再折」）…');
-      const price = await capturePrice();
-      renderPageHeader({ shop, title, price, exclusion, limit, sections });
-
-      const shopType = shop.type;
-      const discounts = await captureDiscounts(shopType, setProgress);
-      const rewards = await captureRewards(shopType, setProgress);
-      const mopro = captureMoPro(shopType);
-      const couponResult = await captureCoupons(shopType, setProgress, errorWatch);
-      const shipping = captureShipping(shopType);
-
-      const notes = [...couponResult.notes];
-      if (price.isRange) notes.push('價格為區間，須點選品項後重新擷取');
-      if (price.resolvedByPage) {
-        notes.push('「下單再折」由最優惠折價券計算；頁面明示無可用券 → 無下單再折價，price_momo 取促銷價');
-      }
-      if (price.needCouponRuleCheck) {
-        notes.push('「下單再折」價格來自折價券，採用前請先依折價券規則檢查該券（含 月份／限定／限時／秘密／專屬／獨家／會員 者不採用）');
-      }
-      if (price.orderDiscountUnresolved) notes.push('「下單再折」展開後仍讀不到折扣後價格，請人工確認後手動填 price_momo');
-      if (shopType === '未確定') notes.push('賣場類型未確定：券別規則與運費規則請人工判斷');
-      if (discounts.length > 1) notes.push('複數折扣活動：Excel 請先算上方第一個，再算下方第二個');
-      notes.push(shopType === 'MO+'
-        ? 'MO+ 計算順序：(單品券／單店折扣) → 單店券 → 跨店活動 → 再判定免運門檻'
-        : '一般MOMO：折扣活動 & 折價券僅擇 1 種最優惠，且折價券無法與上方折扣活動疊加');
-
-      latest = {
-        title, shop, price, limit, pageExclusions: exclusion.reasons, shipping, notes,
-        couponState: couponResult.couponState,
-        apiErrors: couponResult.apiErrors || [],
-        offers: [...discounts, ...couponResult.offers, ...rewards, ...mopro],
-      };
-      renderResults(latest);
-      const usableCount = latest.offers.filter((offer) => offer.status === 'usable').length;
-      const reviewCount = latest.offers.filter((offer) => offer.status === 'review').length;
-      const failed = latest.couponState === 'failed';
-      setProgress(failed
-        ? `擷取完成但折價券讀取失敗：可填入 ${usableCount} 項；人工確認 ${reviewCount} 項。折價券必須人工複查。`
-        : `擷取完成：可填入 ${usableCount} 項；人工確認 ${reviewCount} 項。未做任何金額計算。`,
-      failed ? 'bad' : (usableCount ? 'ok' : 'warn'));
-      return latest;
-    } catch (error) {
-      console.error('[MOMO 助手] 擷取失敗', error);
-      setProgress(`擷取失敗：${normalize(error?.message || error)}`, 'bad');
-      return null;
+      state.offers = scanOfferTexts(state.facts.mode);
+      renderFacts();
+      renderOffers();
     } finally {
-      errorWatch.stop();
-      await closeAnyDialog();
-      busy = false;
-      $('#capture').disabled = false;
+      state.autoExpanding = false;
+      if (button) button.disabled = false;
+      renderAutoStatus();
     }
   }
 
-  function enableDragging() {
-    const panel = $('.panel');
-    const handle = $('header');
-    let drag = null;
-    handle.addEventListener('pointerdown', (event) => {
-      if (event.button !== 0 || event.target.closest('button')) return;
-      const rect = panel.getBoundingClientRect();
-      drag = { pointerId: event.pointerId, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
-      panel.style.left = `${rect.left}px`; panel.style.top = `${rect.top}px`; panel.style.right = 'auto';
-      handle.setPointerCapture?.(event.pointerId); event.preventDefault();
+  function bestDiscount(offers, base, qty) {
+    return offers.map((offer) => ({ offer, amount: discountAmount(offer, base, qty) }))
+      .sort((a, b) => b.amount - a.amount)[0] || { offer: null, amount: 0 };
+  }
+
+  function selectedUsable(category) {
+    return state.offers.filter((offer) => offer.status === 'usable' && (Array.isArray(category) ? category.includes(offer.category) : offer.category === category));
+  }
+
+
+  function offerMeetsConditions(offer, base, qty) {
+    const facts = offer.facts || parseFacts(offer.text);
+    if (facts.threshold && base < facts.threshold) return false;
+    if (facts.minQty && qty < facts.minQty) return false;
+    return true;
+  }
+
+  function sequentialDiscountPlan(offers, base, qty) {
+    let remaining = base;
+    const used = [];
+    for (const offer of offers) {
+      if (!offerMeetsConditions(offer, remaining, qty)) continue;
+      const amount = discountAmount(offer, remaining, qty);
+      if (!amount) continue;
+      used.push({ offer, amount });
+      remaining = Math.max(0, remaining - amount);
+    }
+    return { amount: base - remaining, used };
+  }
+
+  function rewardAmount(offer, base, qty) {
+    if (!offerMeetsConditions(offer, base, qty)) return 0;
+    const facts = offer.facts || parseFacts(offer.text);
+    let amount = facts.rewardRate
+      ? roundMoney(base * facts.rewardRate / 100)
+      : roundMoney(facts.rewardFixed || 0);
+    if (facts.cap) amount = Math.min(amount, facts.cap);
+    return amount;
+  }
+
+  function isBonusReward(offer) {
+    return /(加碼|另加碼|再加碼|可疊加|可併用)/.test(offer.text);
+  }
+
+  function isMocoinFullGift(offer) {
+    return /(?:滿額贈|滿[^。；，]{0,24}(?:送|贈)[^。；，]{0,18}(?:MO|mo|momo)\s*幣)/i.test(offer.text);
+  }
+
+  function rewardNote(offer, unit, prefix = '') {
+    const facts = offer.facts || parseFacts(offer.text);
+    if (facts.rewardRate) return `${unit}${prefix}${facts.rewardRate}%`;
+    if (facts.rewardFixed) return `${unit}${prefix}${facts.rewardFixed}`;
+    return `${unit}${prefix}`.trim();
+  }
+
+  function discountOfferNote(offer, amount) {
+    if (!offer) return '';
+    const facts = offer.facts || parseFacts(offer.text);
+    const label = CATEGORY_LABELS[offer.category] || '優惠';
+    const threshold = facts.threshold ? `滿${facts.threshold}` : '';
+    if (facts.fold) return `${label}${threshold ? threshold + '，' : ''}${facts.fold}折`;
+    if (facts.fixed) return `${label}${threshold ? threshold : ''}折${facts.fixed}`;
+    if (offer.category === 'order-discount') return `下單再折 ${amount}元`;
+    const activityNote = activityNoteFrom(offer);
+    return activityNote || `${label} ${amount}元`;
+  }
+
+  function calculate() {
+    const mode = $('#mode').value;
+    const unitPrice = toNumber($('#unitPrice').value);
+    const qty = Math.max(1, Math.floor(toNumber($('#qty').value) || 1));
+    const gross = roundMoney(unitPrice * qty);
+    const notes = [];
+    const warnings = [];
+
+    if (!$('#commonPassed').checked) warnings.push('尚未確認共同主流程與特殊品類例外；本助手不能代替品牌、規格、效期、貨源與組數判斷。');
+    if (!unitPrice) warnings.push('售價未填，無法可靠計算。');
+    if (state.facts.priceRange) warnings.push('偵測到價格區間，請確認目前規格對應的單價。');
+    if ($('#limitOne').checked) notes.push('限購一組／僅限下單一次');
+
+    // MoPro 價差獨立填 discount_mopro，不重複寫入 note_momo。
+    const moProChoice = selectedUsable('mopro')
+      .map((offer) => ({
+        offer,
+        amount: roundMoney((offer.facts.moProSave || offer.facts.fixed || 0) * qty),
+      }))
+      .sort((a, b) => b.amount - a.amount)[0] || { offer: null, amount: 0 };
+    const discountMopro = Math.min(gross, moProChoice.amount);
+
+    let discountMomo = 0;
+    const usedOffers = [];
+
+    if (mode === 'moplus') {
+      // MO+：促銷價為基準；第一層只比較「單品券 vs 單店活動」。
+      const itemCoupon = bestDiscount(selectedUsable('item-coupon'), gross, qty);
+      const storeActivity = bestDiscount(selectedUsable('store-activity'), gross, qty);
+      const first = itemCoupon.amount >= storeActivity.amount ? itemCoupon : storeActivity;
+      if (first.offer && first.amount) {
+        discountMomo = first.amount;
+        usedOffers.push(first);
+      }
+
+      // 單店券門檻只用上一層一般折扣後金額，不先扣 discount_mopro。
+      const afterFirst = Math.max(0, gross - discountMomo);
+      const store = bestDiscount(selectedUsable('store-coupon'), afterFirst, qty);
+      if (store.offer && store.amount) {
+        discountMomo += store.amount;
+        usedOffers.push(store);
+      }
+
+      // 跨店活動再依最新折後金額重新判斷。
+      const afterStore = Math.max(0, gross - discountMomo);
+      const cross = bestDiscount(selectedUsable('cross-store'), afterStore, qty);
+      if (cross.offer && cross.amount) {
+        discountMomo += cross.amount;
+        usedOffers.push(cross);
+      }
+    } else {
+      // 一般 MOMO：複數折扣活動依頁面掃描順序逐層計算，
+      // 再和「折價券方案」擇優；兩個方案不可疊加。
+      if ($('#priceIncluded').checked) {
+        const visibleActivity = selectedUsable(['page-discount', 'order-discount', 'store-activity'])[0] || null;
+        const activityNote = visibleActivity ? discountOfferNote(visibleActivity, 0) : '';
+        if (activityNote) notes.push(activityNote);
+        notes.push('頁面價已含上方折扣活動，未再疊加下方折價券或重複計入 discount_momo');
+      } else {
+        const activityOffers = selectedUsable(['page-discount', 'order-discount', 'store-activity']);
+        const activityPlan = sequentialDiscountPlan(activityOffers, gross, qty);
+        const couponPlan = bestDiscount(selectedUsable(['item-coupon', 'store-coupon']), gross, qty);
+
+        if (activityPlan.amount >= couponPlan.amount) {
+          discountMomo = activityPlan.amount;
+          usedOffers.push(...activityPlan.used);
+        } else if (couponPlan.offer && couponPlan.amount) {
+          discountMomo = couponPlan.amount;
+          usedOffers.push(couponPlan);
+        }
+      }
+    }
+
+    discountMomo = Math.min(gross, roundMoney(discountMomo));
+    usedOffers.forEach(({ offer, amount }) => {
+      const note = discountOfferNote(offer, amount);
+      if (note) notes.push(note);
     });
-    handle.addEventListener('pointermove', (event) => {
-      if (!drag || event.pointerId !== drag.pointerId) return;
-      const rect = panel.getBoundingClientRect();
-      const maxLeft = Math.max(0, window.innerWidth - rect.width);
-      const maxTop = Math.max(0, window.innerHeight - Math.min(rect.height, window.innerHeight));
-      panel.style.left = `${Math.min(maxLeft, Math.max(0, event.clientX - drag.offsetX))}px`;
-      panel.style.top = `${Math.min(maxTop, Math.max(0, event.clientY - drag.offsetY))}px`;
-      event.preventDefault();
+
+    // 回饋與 MO+ 免運門檻使用實際付款基礎：一般折扣 + MoPro 價差均已扣除。
+    const paidBase = Math.max(0, gross - discountMomo - discountMopro);
+
+    // MO幣：預設 3% 與其他「非加碼」回饋擇優；明示加碼才相加。
+    // 滿額贈 MO幣獨立加回，可使總 MO幣超過一般 2,000 上限。
+    const coinOffers = selectedUsable('mocoin');
+    const baseCoinCandidates = [{
+      offer: null,
+      amount: roundMoney(paidBase * 0.03),
+      note: 'MO幣3%回饋',
+    }];
+
+    const bonusCoin = [];
+    const fullGiftCoin = [];
+    coinOffers.forEach((offer) => {
+      const amount = rewardAmount(offer, paidBase, qty);
+      if (!amount) return;
+      if (isMocoinFullGift(offer)) {
+        fullGiftCoin.push({ offer, amount });
+      } else if (isBonusReward(offer)) {
+        bonusCoin.push({ offer, amount });
+      } else {
+        baseCoinCandidates.push({ offer, amount, note: rewardNote(offer, 'MO幣', '回饋') });
+      }
     });
-    const stop = (event) => {
-      if (!drag || event.pointerId !== drag.pointerId) return;
-      handle.releasePointerCapture?.(event.pointerId); drag = null;
+
+    const baseCoin = baseCoinCandidates.sort((a, b) => b.amount - a.amount)[0];
+    let cappedCoin = baseCoin?.amount || 0;
+    if (baseCoin?.note) notes.push(baseCoin.note);
+
+    bonusCoin.forEach(({ offer, amount }) => {
+      cappedCoin += amount;
+      notes.push(rewardNote(offer, 'MO幣', '加碼'));
+    });
+
+    cappedCoin = Math.min(cappedCoin, 2000);
+    let conback = cappedCoin;
+    fullGiftCoin.forEach(({ offer, amount }) => {
+      conback += amount;
+      notes.push(rewardNote(offer, 'MO幣', '滿額贈'));
+    });
+
+    // MO點：不自行把所有活動相加。非加碼活動只取較高者；
+    // 只有明示「加碼／可疊加」者再相加。MO點沒有一般 2,000 上限。
+    const pointOffers = selectedUsable('mopoint');
+    const pointBaseCandidates = [];
+    const pointBonus = [];
+    pointOffers.forEach((offer) => {
+      const amount = rewardAmount(offer, paidBase, qty);
+      if (!amount) return;
+      if (isBonusReward(offer)) pointBonus.push({ offer, amount });
+      else pointBaseCandidates.push({ offer, amount });
+    });
+
+    let pointBack = 0;
+    if (pointBaseCandidates.length) {
+      const bestPoint = pointBaseCandidates.sort((a, b) => b.amount - a.amount)[0];
+      pointBack += bestPoint.amount;
+      notes.push(rewardNote(bestPoint.offer, 'MO點', '回饋'));
+    }
+    pointBonus.forEach(({ offer, amount }) => {
+      pointBack += amount;
+      notes.push(rewardNote(offer, 'MO點', '加碼'));
+    });
+
+    // moPro 訂閱會員 MO點依決策圖只備註，不計入 Pointsback_platform_momo。
+    state.offers.filter((offer) => offer.status === 'note' && offer.category === 'mopro-note')
+      .forEach((offer) => notes.push(normalize(offer.text).slice(0, 90)));
+
+    let shipping = 0;
+    if (mode === 'moplus') {
+      const shippingCoupon = selectedUsable('shipping-coupon')
+        .find((offer) => offerMeetsConditions(offer, paidBase, qty));
+      const shippingRuleMet = selectedUsable('shipping-rule').some((offer) => (
+        offerMeetsConditions(offer, paidBase, qty)
+      ));
+      if (shippingCoupon) notes.push('使用免運券');
+      else if (!shippingRuleMet) shipping = roundMoney(toNumber($('#shipping').value));
+    }
+
+    const reviewCount = state.offers.filter((offer) => offer.status === 'review').length;
+    if (reviewCount) warnings.push(`有 ${reviewCount} 項優惠無法自動分類，需人工確認。`);
+    if (state.offers.some((offer) => /登入|登錄/.test(offer.text))) warnings.push('部分優惠可能需登入後才完整顯示。');
+    if (!state.offers.length) warnings.push('尚未讀到優惠；請先展開頁面活動內容後重新掃描。');
+
+    state.output = {
+      price_momo: gross,
+      qty_momo: qty,
+      discount_mopro: discountMopro,
+      discount_momo: discountMomo,
+      conback_momo: conback,
+      Pointsback_platform_momo: pointBack,
+      shipping_fee_mo_plus: shipping,
+      note_momo: unique(notes).join(' / '),
     };
-    handle.addEventListener('pointerup', stop); handle.addEventListener('pointercancel', stop);
-    handle.addEventListener('dblclick', (event) => {
-      if (event.target.closest('button')) return;
-      panel.style.left = 'auto'; panel.style.right = '12px'; panel.style.top = '12px';
-    });
+    renderResults(warnings);
   }
 
-  function destroy() {
-    host.remove();
-    if (window.MomoJudgementHelper?.version === VERSION) delete window.MomoJudgementHelper;
+  function renderResults(warnings) {
+    const labels = {
+      price_momo: 'price_momo', qty_momo: 'qty_momo', discount_mopro: 'discount_mopro',
+      discount_momo: 'discount_momo', conback_momo: 'conback_momo',
+      Pointsback_platform_momo: 'Pointsback_platform_momo',
+      shipping_fee_mo_plus: 'shipping_fee_mo_plus', note_momo: 'note_momo',
+    };
+    $('#results').innerHTML = Object.entries(state.output).map(([key, value]) => `
+      <tr><td>${escapeHtml(labels[key])}</td><td>${escapeHtml(value)}</td><td><button class="btn secondary one-copy" data-key="${escapeHtml(key)}" style="padding:4px 7px">複製</button></td></tr>`).join('');
+    $('#resultSection').classList.remove('hidden');
+    $('#audit').innerHTML = warnings.length
+      ? `<div class="notice bad" style="margin-top:8px">${warnings.map(escapeHtml).join('<br>')}</div>`
+      : '<div class="notice good" style="margin-top:8px">未發現阻擋計算的問題；送出前仍請核對價格、規格與優惠門檻。</div>';
+    $('#resultSection').scrollIntoView({ block: 'nearest' });
   }
 
-  $('#close').addEventListener('click', destroy);
-  $('#capture').addEventListener('click', capture);
-  $('#copyUsable').addEventListener('click', () => latest && copyText(toTsv(latest, true), $('#copyUsable')));
-  $('#copyAll').addEventListener('click', () => latest && copyText(toTsv(latest, false), $('#copyAll')));
-  enableDragging();
-  renderPageHeader({
-    shop: detectShopType(), title: getTitle(), price: null,
-    exclusion: getPageExclusions(), limit: getPurchaseLimit(), sections: getProductSections(),
+  async function copyText(text, button) {
+    try {
+      await navigator.clipboard.writeText(String(text));
+      const original = button.textContent;
+      button.textContent = '已複製';
+      setTimeout(() => { button.textContent = original; }, 900);
+    } catch (_) {
+      prompt('請手動複製：', String(text));
+    }
+  }
+
+  $('#calculate').addEventListener('click', calculate);
+  $('#autoScan').addEventListener('click', autoExpandAndRescan);
+  $('#mode').addEventListener('change', (event) => {
+    state.facts.mode = event.currentTarget.value;
+    state.offers = scanOfferTexts(state.facts.mode);
+    renderOffers();
   });
-  window.MomoJudgementHelper = { version: VERSION, capture, result: () => latest, destroy };
-  console.info(`[MOMO / MO+ 優惠擷取助手 v${VERSION}] 已啟動。不計算、不領券；只讀取、分類並判斷可否採用。`);
+  $('#rescan').addEventListener('click', () => {
+    const selectedMode = $('#mode').value;
+    state.facts = getPageFacts();
+    state.facts.mode = selectedMode;
+    state.offers = scanOfferTexts(state.facts.mode);
+    renderFacts(); renderOffers(); renderAutoStatus();
+  });
+  $('#copyValues').addEventListener('click', (event) => {
+    if (!state.output) return;
+    copyText(Object.values(state.output).join('\t'), event.currentTarget);
+  });
+  $('#copyDetail').addEventListener('click', (event) => {
+    if (!state.output) return;
+    copyText(Object.entries(state.output).map(([key, value]) => `${key}\t${value}`).join('\n'), event.currentTarget);
+  });
+  $('#results').addEventListener('click', (event) => {
+    const button = event.target.closest('.one-copy');
+    if (button && state.output) copyText(state.output[button.dataset.key], button);
+  });
+  $('#collapse').addEventListener('click', () => {
+    state.collapsed = !state.collapsed;
+    panel.classList.toggle('collapsed', state.collapsed);
+    $('#collapse').textContent = state.collapsed ? '+' : '−';
+  });
+  $('#close').addEventListener('click', () => window.MomoJudgementHelper.destroy());
+
+  let drag = null;
+  $('.head').addEventListener('pointerdown', (event) => {
+    if (event.target.closest('button')) return;
+    const rect = host.getBoundingClientRect();
+    drag = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    $('.head').setPointerCapture(event.pointerId);
+  });
+  $('.head').addEventListener('pointermove', (event) => {
+    if (!drag) return;
+    host.style.left = `${Math.max(0, Math.min(innerWidth - host.offsetWidth, event.clientX - drag.x))}px`;
+    host.style.top = `${Math.max(0, Math.min(innerHeight - 40, event.clientY - drag.y))}px`;
+    host.style.right = 'auto';
+  });
+  $('.head').addEventListener('pointerup', () => { drag = null; });
+
+  window.MomoJudgementHelper = {
+    version: VERSION,
+    async autoExpandAndRescan() { await autoExpandAndRescan(); },
+    rescan() {
+      const selectedMode = $('#mode')?.value || state.facts.mode;
+      state.facts = getPageFacts();
+      state.facts.mode = selectedMode;
+      state.offers = scanOfferTexts(state.facts.mode);
+      renderFacts(); renderOffers(); renderAutoStatus();
+    },
+    calculate,
+    getState: () => JSON.parse(JSON.stringify(state)),
+    destroy() { host.remove(); delete window.MomoJudgementHelper; },
+  };
+
+  renderFacts();
+  renderOffers();
+  renderAutoStatus();
 })();
