@@ -2,7 +2,7 @@
   'use strict';
 
   const APP_ID = 'pchome-judgement-helper';
-  const VERSION = '2.1.0';
+  const VERSION = '2.3.1';
 
   if (window.PCHomeJudgementHelper?.destroy) window.PCHomeJudgementHelper.destroy();
   else document.getElementById(APP_ID)?.remove();
@@ -53,39 +53,64 @@
     return match ? match[0].replace(/,/g, '') : '';
   }
 
+  const toNumber = (value) => {
+    const parsed = Number(String(value ?? '').replace(/,/g, '').trim());
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+
+  const roundMoney = (value) => Math.max(0, Math.round(Number(value) || 0));
+
+  function money(value) {
+    return roundMoney(value).toLocaleString('zh-TW');
+  }
+
   function getPageFacts() {
+    const currentPriceElement = document.querySelector('[data-regression="prod_redPrice"]');
+    const priceArea = currentPriceElement?.closest('.c-prodInfoV2__price, .c-prodInfo__price')
+      || currentPriceElement?.parentElement?.parentElement;
+    const priceContext = normalize(priceArea?.innerText || priceArea?.textContent);
     return {
       title: getTitle(),
       url: location.href,
       currentPrice: numberText(textOf('[data-regression="prod_redPrice"]')),
       originalPrice: numberText(textOf('[data-regression="prodPage_originalPrice"]')),
+      priceContext,
+      priceIncludesPromotion: /(折扣價|點我再折扣|促銷價|特價)/.test(priceContext),
       isPChome: /(^|\.)pchome\.com\.tw$/i.test(location.hostname),
     };
   }
 
   function getPageExclusions() {
     const title = getTitle();
-    const interactives = unique(
-      [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')]
+    const primaryActions = unique(
+      [...document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]')]
         .filter(isVisible)
         .map((element) => element.value || element.innerText || element.textContent)
         .filter((text) => normalize(text).length <= 80),
     );
+    const linksAndActions = unique(
+      [...document.querySelectorAll('button, a, [role="button"]')]
+        .filter(isVisible)
+        .map((element) => element.innerText || element.textContent)
+        .filter((text) => normalize(text).length <= 80),
+    );
     const reasons = [];
     if (/(電子票券|電子憑證)/.test(title)) reasons.push('商品標題為電子票券／電子憑證');
-    if (interactives.some((text) => /^(售完|已售完)$/.test(text))) reasons.push('頁面顯示售完');
-    if (interactives.some((text) => text.includes('有貨通知我'))) reasons.push('頁面顯示有貨通知我');
-    if (interactives.some((text) => text.includes('前往活動賣場'))) reasons.push('頁面只能前往活動賣場');
-    if (interactives.some((text) => text === '選購')) reasons.push('購買按鈕為選購');
+    if (primaryActions.some((text) => /^(售完|已售完)$/.test(text))) reasons.push('頁面顯示售完');
+    if (primaryActions.some((text) => text.includes('有貨通知我'))) reasons.push('頁面顯示有貨通知我');
+    if (linksAndActions.some((text) => text.includes('前往活動賣場'))) reasons.push('頁面只能前往活動賣場');
+    if (primaryActions.some((text) => text === '選購')) reasons.push('購買按鈕為選購');
     return unique(reasons);
   }
 
   function parseFacts(text) {
     const value = normalize(text).replace(/，/g, ',').replace(/％/g, '%');
-    const threshold = value.match(/(?:單筆(?:消費)?[^。；，]{0,18}?滿|滿)\s*\$?\s*([\d,]+)\s*(?:元)?/);
+    const threshold = value.match(/(?:單筆(?:消費)?[^。；，]{0,18}?滿|滿)\s*(?:\$\s*([\d,]+)|([\d,]+)\s*元)/);
+    const minQty = value.match(/(?:滿|任選)\s*([\d,]+)\s*(?:件|入|組|包|盒|罐|瓶|個)/);
     const pcoinFixed = value.match(/送\s*([\d,]+)\s*P幣/i);
     const pcoinRate = value.match(/(?:送|回饋)?\s*([\d.]+)\s*%\s*P幣/i);
     const cap = value.match(/(?:最高|上限)\s*\$?\s*([\d,]+)\s*(P幣|元)?/i);
+    const finalPrice = value.match(/(?:折扣後(?:金額|價格)|券後(?:價|金額)|優惠價)\s*\$?\s*([\d,]+)/);
     const fullDiscount = value.match(/([\d.]+)\s*折(?:\D|$)/);
     const fixedDiscount = value.match(/(?:滿\s*\$?\s*[\d,]+\s*(?:元)?\s*)?(?:現折|現抵|折抵|折)\s*\$?\s*([\d,]+)\s*(?:元)?/);
     const percent = value.match(/(?:現折|現抵|折抵|省|回饋)\s*([\d.]+)\s*%/);
@@ -93,11 +118,13 @@
     let unit = '';
     if (pcoinFixed) [benefit, unit] = [pcoinFixed[1].replace(/,/g, ''), 'P幣'];
     else if (pcoinRate) [benefit, unit] = [pcoinRate[1], '% P幣'];
-    else if (fixedDiscount) [benefit, unit] = [fixedDiscount[1].replace(/,/g, ''), '元'];
+    else if (finalPrice) [benefit, unit] = [finalPrice[1].replace(/,/g, ''), '折後價'];
     else if (fullDiscount) [benefit, unit] = [fullDiscount[1], '折'];
+    else if (fixedDiscount) [benefit, unit] = [fixedDiscount[1].replace(/,/g, ''), '元'];
     else if (percent) [benefit, unit] = [percent[1], '%'];
     return {
-      threshold: threshold ? threshold[1].replace(/,/g, '') : '',
+      threshold: threshold ? (threshold[1] || threshold[2]).replace(/,/g, '') : '',
+      minQty: minQty ? minQty[1].replace(/,/g, '') : '',
       benefit,
       unit,
       cap: cap ? cap[1].replace(/,/g, '') : '',
@@ -123,11 +150,11 @@
     const thursdayTwoPercent = /週四.{0,24}(2\s*%|2％)|(2\s*%|2％).{0,24}週四/.test(relevant);
     const memberOnly = /(會員專屬|指定會員|會員限時)/.test(relevant);
     const couponContext = /券/.test(offer.category || '') || offer.source === 'coupon';
-    const couponLimited = couponContext && /限量/.test(relevant);
     const quota = quotaFrom(relevant);
+    const couponLimited = couponContext && /限量/.test(relevant)
+      && (!Number.isFinite(quota) || quota < 1000);
     const underThousand = Number.isFinite(quota) && quota < 1000;
-    const vagueLimited = /(數量有限|送完為止|贈完為止|點數有限)/.test(relevant)
-      || (/限量/.test(relevant) && !Number.isFinite(quota));
+    const vagueLimited = /限量/.test(relevant) && !Number.isFinite(quota);
     const prime = /(星展\s*(PChome)?\s*(Prime)?\s*聯名卡|星展\s*Prime|PChome\s*聯名卡)/i.test(main);
     const paymentText = normalize(`${main} ${payment}`);
     const anyPayment = /任一付款方式/.test(payment);
@@ -144,12 +171,9 @@
     if (unavailable) return { status: 'reject', reason: '頁面顯示此券目前不可使用' };
     if (couponLimited) return { status: 'reject', reason: '寫有「限量」的折價券不採用' };
     if (underThousand) return { status: 'reject', reason: `名額 ${quota}，少於 1,000` };
-    if (vagueLimited) return { status: 'reject', reason: '限量／送完為止，且無可確認名額' };
+    if (vagueLimited) return { status: 'reject', reason: '只寫「限量」但未標明名額' };
     if (paymentRestricted) return { status: 'reject', reason: '限定付款方式不採用' };
     if (gift) return { status: 'ignore', reason: '贈品忽略' };
-    if (Number.isFinite(quota) && quota >= 1000) {
-      return { status: 'review', reason: '名額不少於 1,000；既有規則未指定可直接採用，需人工確認' };
-    }
     if (['promotion', 'discount'].includes(offer.source) && offer.detailRequired && !offer.detailLoaded) {
       return { status: 'review', reason: '未讀到官方活動明細，無法確認隱藏條件' };
     }
@@ -161,7 +185,7 @@
       return { status: 'review', reason: '右側勾選存在但不可操作；頁面未明示原因' };
     }
     if (!['折扣活動', '單品券', '滿折券', 'P幣'].includes(offer.category)) {
-      return { status: 'review', reason: '不屬於四個指定欄位，需人工確認' };
+      return { status: 'review', reason: '不屬於四種指定優惠類型，需人工確認' };
     }
     if (offer.source === 'coupon' && offer.category === '單品券' && offer.checkSelectable) {
       return { status: 'usable', reason: '右側勾選可操作，且未觸發排除規則' };
@@ -398,7 +422,7 @@
       const key = `${category}\u0000${summary}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      rows.push({ label, summary, category, ...check });
+      rows.push({ label, summary, category, availableCount: 1, ...check });
     }
     return rows;
   }
@@ -448,6 +472,7 @@
       const key = `${row.category}\u0000${row.summary}`;
       const existing = uniqueRows.get(key);
       if (existing) {
+        existing.availableCount += row.availableCount || 1;
         existing.checkFound = existing.checkFound || row.checkFound;
         existing.checkSelectable = existing.checkSelectable || row.checkSelectable;
       } else uniqueRows.set(key, { ...row });
@@ -456,6 +481,7 @@
       const offer = {
         source: 'coupon', category: row.category, label: row.label, summary: row.summary,
         fields: {}, detailRequired: false, detailLoaded: true, facts: parseFacts(row.summary),
+        availableCount: row.availableCount || 1,
         checkFound: row.checkFound, checkSelectable: row.checkSelectable,
       };
       Object.assign(offer, classifyOffer(offer));
@@ -484,8 +510,12 @@
         justify-content: space-between; gap: 8px; padding: 11px 12px; color: #fff; background: #b42318;
         cursor: move; user-select: none; touch-action: none; }
       header strong { font-size: 15px; }
+      .header-actions { display: flex; align-items: center; gap: 6px; }
       header button { width: 28px; height: 28px; padding: 0; color: #fff; background: transparent;
         border: 1px solid rgba(255,255,255,.5); border-radius: 6px; cursor: pointer; }
+      .panel.is-collapsed { width: 310px; max-height: none; overflow: hidden; }
+      .panel.is-collapsed header { position: static; }
+      .panel.is-collapsed main { display: none; }
       main { padding: 12px; } section { margin: 0 0 12px; padding: 10px; border: 1px solid #e2e8f0; border-radius: 9px; }
       h2 { margin: 0 0 8px; font-size: 14px; } p { margin: 6px 0; }
       .muted { color: #64748b; font-size: 12px; }
@@ -494,8 +524,16 @@
       .warn { color: #92400e; background: #fef3c7; } .info { color: #1e3a8a; background: #dbeafe; }
       .facts { display: grid; grid-template-columns: 90px 1fr; gap: 4px 8px; } .facts b { overflow-wrap: anywhere; }
       label { display: block; margin-top: 8px; color: #334155; font-size: 12px; }
-      textarea { width: 100%; min-height: 58px; margin-top: 3px; padding: 7px 8px; resize: vertical;
+      input[type="number"], input[type="text"], select, textarea { width: 100%; margin-top: 3px; padding: 7px 8px;
         color: #111827; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; font: inherit; }
+      textarea { min-height: 58px; resize: vertical; }
+      input[readonly] { color: #0f172a; background: #f1f5f9; font-weight: 700; }
+      .calc-grid, .result-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 10px; }
+      .checkline { display: flex; align-items: center; gap: 7px; margin-top: 24px; font-size: 12px; }
+      .checkline input { width: auto; margin: 0; }
+      .formula { margin-top: 8px; padding: 8px; color: #334155; background: #f8fafc;
+        border: 1px dashed #cbd5e1; border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+      @media (max-width: 520px) { .calc-grid, .result-grid { grid-template-columns: 1fr; } .checkline { margin-top: 4px; } }
       button.action { padding: 8px 11px; color: #fff; background: #b42318; border: 0;
         border-radius: 6px; cursor: pointer; font: inherit; font-weight: 700; }
       button.action:disabled { opacity: .55; cursor: wait; } button.secondary { color: #334155; background: #f1f5f9; }
@@ -506,8 +544,8 @@
       .ignore { color: #64748b; } .evidence { color: #475569; font-size: 12px; } .hidden { display: none !important; }
     </style>
     <div class="panel">
-      <header title="按住拖曳；雙擊回到右上角"><strong>PChome 優惠擷取助手 v${VERSION}</strong><button id="close" title="關閉">×</button></header>
-      <main>
+      <header title="按住拖曳；雙擊回到右上角"><strong>PChome 優惠擷取助手 v${VERSION}</strong><span class="header-actions"><button id="collapse" type="button" title="收合" aria-controls="helperContent" aria-expanded="true">−</button><button id="close" type="button" title="關閉">×</button></span></header>
+      <main id="helperContent">
         <section id="pageSection"></section>
         <div id="progress" class="status info">尚未擷取。按下「自動抓取優惠」。</div>
         <div class="actions">
@@ -515,6 +553,31 @@
           <button class="action secondary" id="copyUsable" disabled>複製可填資料</button>
           <button class="action secondary" id="copyAll" disabled>複製完整判斷</button>
         </div>
+        <section id="calculatorSection">
+          <h2>五欄位計算</h2>
+          <div class="calc-grid">
+            <label>qty_pchome（PChome 下單數量）
+              <input id="qtyInput" type="number" min="1" step="1" value="1">
+            </label>
+            <label class="checkline"><input id="priceIncludesPromotion" type="checkbox">目前售價已包含頁面折扣活動</label>
+          </div>
+          <div class="actions">
+            <button class="action" id="calculate" disabled>計算五欄位</button>
+            <button class="action secondary" id="copyFields" disabled>複製五欄位</button>
+          </div>
+          <div id="calcMessage" class="status warn">請先執行「自動抓取優惠」。</div>
+          <div id="fieldResults" class="hidden">
+            <div class="result-grid">
+              <label>price_pchome<input id="priceOutput" type="text" readonly></label>
+              <label>qty_pchome<input id="qtyOutput" type="text" readonly></label>
+              <label>discount_pchome<input id="discountOutput" type="text" readonly></label>
+              <label>conback_pchome<input id="coinbackOutput" type="text" readonly></label>
+            </div>
+            <label>note_pchome<textarea id="noteOutput" readonly></textarea></label>
+            <div id="formulaOutput" class="formula"></div>
+            <label>計算明細（供檢查）<textarea id="calculationNote" readonly></textarea></label>
+          </div>
+        </section>
         <section id="filledSection" class="hidden">
           <h2>符合規則，可填入</h2>
           <label>折扣活動<textarea id="activityOutput" readonly></textarea></label>
@@ -531,6 +594,212 @@
   let latest = null;
   let busy = false;
 
+  function discountFromFacts(offer, baseAmount, orderQty = 1) {
+    const facts = offer.facts || {};
+    const threshold = toNumber(facts.threshold);
+    const minQty = toNumber(facts.minQty);
+    const base = Math.max(0, toNumber(baseAmount));
+    if (threshold && base < threshold) return null;
+    if (minQty && orderQty < minQty) return null;
+
+    let amount = 0;
+    let formula = '';
+    const benefit = toNumber(facts.benefit);
+    if (!benefit) return null;
+
+    if (facts.unit === '元') {
+      amount = benefit;
+      formula = `${money(benefit)} 元`;
+    } else if (facts.unit === '折後價') {
+      if (benefit >= base) return null;
+      amount = base - benefit;
+      formula = `${money(base)} - 折後價 ${money(benefit)}`;
+    } else if (facts.unit === '折') {
+      const fold = benefit > 10 ? benefit / 10 : benefit;
+      if (fold <= 0 || fold >= 10) return null;
+      const rate = (10 - fold) / 10;
+      amount = roundMoney(base * rate);
+      formula = `ROUND(${money(base)} × ${(rate * 100).toFixed(1).replace(/\.0$/, '')}%, 0)`;
+    } else if (facts.unit === '%') {
+      amount = roundMoney(base * benefit / 100);
+      formula = `ROUND(${money(base)} × ${benefit}%, 0)`;
+    } else return null;
+
+    const cap = toNumber(facts.cap);
+    if (cap) {
+      amount = Math.min(amount, cap);
+      formula = `MIN(${formula}, ${money(cap)})`;
+    }
+    return { amount: roundMoney(amount), formula, threshold, minQty };
+  }
+
+  function cashbackFromFacts(offer, netAmount, orderQty = 1) {
+    const facts = offer.facts || {};
+    const threshold = toNumber(facts.threshold);
+    const minQty = toNumber(facts.minQty);
+    const net = Math.max(0, toNumber(netAmount));
+    if (threshold && net < threshold) return null;
+    if (minQty && orderQty < minQty) return null;
+
+    const benefit = toNumber(facts.benefit);
+    if (!benefit) return null;
+    let amount = 0;
+    let formula = '';
+    if (facts.unit === 'P幣') {
+      amount = benefit;
+      formula = `${money(benefit)} P幣`;
+    } else if (facts.unit === '% P幣') {
+      amount = roundMoney(net * benefit / 100);
+      formula = `ROUND(${money(net)} × ${benefit}%, 0)`;
+    } else return null;
+
+    const cap = toNumber(facts.cap);
+    if (cap) {
+      amount = Math.min(amount, cap);
+      formula = `MIN(${formula}, ${money(cap)})`;
+    }
+    return { amount: roundMoney(amount), formula, threshold, minQty };
+  }
+
+  function offerName(offer) {
+    return normalize(offer.label ? `[${offer.label}] ${offer.summary}` : offer.summary) || offer.category;
+  }
+
+  function chooseDiscount(offers, unitPrice, qty, subtotal, priceIncludesPromotion) {
+    const usable = offers.filter((offer) => offer.status === 'usable');
+    const candidates = [{ amount: 0, name: '無額外折扣', note: '無額外折扣', formula: '0', source: 'none' }];
+
+    const itemUnits = [];
+    usable.filter((offer) => offer.category === '單品券').forEach((offer) => {
+      const result = discountFromFacts(offer, unitPrice, qty);
+      if (!result?.amount) return;
+      const count = Math.max(1, Math.floor(toNumber(offer.availableCount) || 1));
+      for (let index = 0; index < count; index += 1) {
+        itemUnits.push({ ...result, name: offerName(offer), offer });
+      }
+    });
+    const selectedItemUnits = itemUnits.sort((a, b) => b.amount - a.amount).slice(0, qty);
+    if (selectedItemUnits.length) {
+      const amount = selectedItemUnits.reduce((sum, item) => sum + item.amount, 0);
+      const groups = new Map();
+      selectedItemUnits.forEach((item) => {
+        const key = `${item.name}\u0000${item.amount}`;
+        const entry = groups.get(key) || { name: item.name, amount: item.amount, count: 0 };
+        entry.count += 1;
+        groups.set(key, entry);
+      });
+      const formula = [...groups.values()].map((item) => `${money(item.amount)} × ${item.count}`).join(' + ');
+      const note = [...groups.values()].map((item) => `${item.name} × ${item.count} 張`).join('；');
+      candidates.push({ amount, name: `單品券 ${selectedItemUnits.length} 張`, note, formula, source: 'item-coupon' });
+    }
+
+    usable.filter((offer) => offer.category === '滿折券').forEach((offer) => {
+      const result = discountFromFacts(offer, subtotal, qty);
+      if (result?.amount) candidates.push({ ...result, name: offerName(offer), note: offerName(offer), source: 'order-coupon' });
+    });
+
+    if (!priceIncludesPromotion) {
+      usable.filter((offer) => offer.category === '折扣活動').forEach((offer) => {
+        const result = discountFromFacts(offer, subtotal, qty);
+        if (result?.amount) candidates.push({ ...result, name: offerName(offer), note: offerName(offer), source: 'activity' });
+      });
+    }
+
+    candidates.sort((a, b) => b.amount - a.amount);
+    return { selected: candidates[0], candidates };
+  }
+
+  function chooseCashback(offers, netAmount, qty) {
+    const candidates = [{
+      amount: roundMoney(netAmount * 0.04),
+      name: 'PChome 聯名卡預設 4%',
+      note: 'PChome 聯名卡 4% 回饋',
+      formula: `ROUND(${money(netAmount)} × 4%, 0)`,
+      source: 'default',
+    }];
+    offers.filter((offer) => offer.status === 'usable' && offer.category === 'P幣').forEach((offer) => {
+      const result = cashbackFromFacts(offer, netAmount, qty);
+      if (result) candidates.push({ ...result, name: offerName(offer), note: offerName(offer), source: 'offer' });
+    });
+    candidates.sort((a, b) => b.amount - a.amount);
+    return { selected: candidates[0], candidates };
+  }
+
+  function calculateFiveFields() {
+    if (!latest) return null;
+    if (latest.pageExclusions?.length) {
+      $('#calcMessage').className = 'status bad';
+      $('#calcMessage').textContent = `賣場不採用：${latest.pageExclusions.join('、')}。不產生五欄位。`;
+      $('#fieldResults').classList.add('hidden');
+      $('#copyFields').disabled = true;
+      return null;
+    }
+
+    const unitPrice = toNumber(latest.page.currentPrice);
+    const qty = Math.floor(toNumber($('#qtyInput').value));
+    if (!unitPrice || qty < 1) {
+      $('#calcMessage').className = 'status bad';
+      $('#calcMessage').textContent = !unitPrice ? '未讀到目前售價，請人工確認頁面價格。' : 'qty_pchome 必須是大於 0 的整數。';
+      $('#fieldResults').classList.add('hidden');
+      $('#copyFields').disabled = true;
+      return null;
+    }
+
+    const subtotal = roundMoney(unitPrice * qty);
+    const priceIncludesPromotion = $('#priceIncludesPromotion').checked;
+    const discountChoice = chooseDiscount(latest.offers, unitPrice, qty, subtotal, priceIncludesPromotion);
+    const discount = Math.min(subtotal, roundMoney(discountChoice.selected.amount));
+    const net = Math.max(0, subtotal - discount);
+    const cashbackChoice = chooseCashback(latest.offers, net, qty);
+    const cashback = roundMoney(cashbackChoice.selected.amount);
+    const reviewCount = latest.offers.filter((offer) => offer.status === 'review').length;
+    const includedPromotionNote = priceIncludesPromotion
+      ? `售價已含頁面折扣活動${latest.page.priceContext ? `（${latest.page.priceContext.slice(0, 120)}）` : ''}`
+      : '';
+    const notePchome = [
+      `折扣：${includedPromotionNote || discountChoice.selected.note || discountChoice.selected.name}`,
+      `回饋：${cashbackChoice.selected.note || cashbackChoice.selected.name}`,
+    ].join('；');
+
+    const fields = {
+      price_pchome: subtotal,
+      qty_pchome: qty,
+      discount_pchome: discount,
+      conback_pchome: cashback,
+      note_pchome: notePchome,
+      discountName: discountChoice.selected.name,
+      cashbackName: cashbackChoice.selected.name,
+      note: [
+        `售價 ${money(unitPrice)} × ${qty} = ${money(subtotal)}`,
+        `折扣採用：${discountChoice.selected.name}；${discountChoice.selected.formula} = ${money(discount)}`,
+        `回饋採用：${cashbackChoice.selected.name}；${cashbackChoice.selected.formula} = ${money(cashback)}`,
+        priceIncludesPromotion ? '目前售價已含頁面折扣活動，因此未重複計算折扣活動。' : '目前售價未標記為已含折扣活動。',
+        reviewCount ? `另有 ${reviewCount} 項優惠需人工確認，尚未納入計算。` : '',
+      ].filter(Boolean).join('\n'),
+    };
+
+    latest.fields = fields;
+    $('#priceOutput').value = String(fields.price_pchome);
+    $('#qtyOutput').value = String(fields.qty_pchome);
+    $('#discountOutput').value = String(fields.discount_pchome);
+    $('#coinbackOutput').value = String(fields.conback_pchome);
+    $('#noteOutput').value = fields.note_pchome;
+    $('#formulaOutput').textContent = `價格：${money(unitPrice)} × ${qty} = ${money(subtotal)}\n折扣：${discountChoice.selected.formula} = ${money(discount)}\n回饋：${cashbackChoice.selected.formula} = ${money(cashback)}`;
+    $('#calculationNote').value = fields.note;
+    $('#fieldResults').classList.remove('hidden');
+    $('#copyFields').disabled = false;
+    $('#calcMessage').className = `status ${reviewCount ? 'warn' : 'ok'}`;
+    $('#calcMessage').textContent = reviewCount
+      ? `已計算五欄位；另有 ${reviewCount} 項需人工確認，未納入。`
+      : '五欄位計算完成。';
+    return fields;
+  }
+
+  function fiveFieldText(fields) {
+    return [fields.price_pchome, fields.qty_pchome, fields.discount_pchome,
+      fields.conback_pchome, fields.note_pchome].join('\t');
+  }
+
   function renderPage() {
     const page = getPageFacts();
     const exclusions = getPageExclusions();
@@ -541,7 +810,8 @@
     $('#pageSection').innerHTML = `<h2>商品頁</h2>${domain}${pageStatus}
       <div class="facts"><span>商品</span><b>${escapeHtml(page.title)}</b>
       <span>目前售價</span><b>${page.currentPrice ? `$${escapeHtml(page.currentPrice)}` : '未讀到'}</b>
-      <span>原價</span><b>${page.originalPrice ? `$${escapeHtml(page.originalPrice)}` : '未讀到'}</b></div>`;
+      <span>原價</span><b>${page.originalPrice ? `$${escapeHtml(page.originalPrice)}` : '未讀到'}</b>
+      <span>價格提示</span><b>${page.priceIncludesPromotion ? '偵測到折扣價／點我再折扣文字' : '未偵測到已含折扣提示'}</b></div>`;
     return { page, exclusions };
   }
 
@@ -553,8 +823,10 @@
   function outputLine(offer) {
     const facts = offer.facts || {};
     const extras = [facts.threshold ? `門檻=${facts.threshold}` : '',
+      facts.minQty ? `件數門檻=${facts.minQty}` : '',
       facts.benefit ? `優惠=${facts.benefit}${facts.unit}` : '',
       facts.cap ? `上限=${facts.cap}` : '',
+      offer.category === '單品券' ? `可辨識張數=${offer.availableCount || 1}` : '',
       offer.checkFound ? `右側勾選=${offer.checkSelectable ? '可選' : '不可選'}` : '',
       offer.fields?.['活動折扣'] ? `說明=${offer.fields['活動折扣']}` : '',
       offer.fields?.['活動期間'] ? `期間=${offer.fields['活動期間']}` : ''].filter(Boolean);
@@ -608,11 +880,11 @@
 
   function toTsv(result, onlyUsable) {
     const rows = onlyUsable ? result.offers.filter((offer) => offer.status === 'usable') : result.offers;
-    const header = ['網址', '商品', '售價', '原價', '判定', '類型', '標籤', '優惠原文', '門檻', '優惠值', '單位', '上限', '右側勾選', '活動期間', '網頁備註', '理由'];
+    const header = ['網址', '商品', '售價', '原價', '判定', '類型', '標籤', '優惠原文', '金額門檻', '件數門檻', '優惠值', '單位', '上限', '右側勾選', '活動期間', '網頁備註', '理由'];
     const clean = (value) => normalize(value).replace(/[\t\r\n]+/g, ' ');
     const data = rows.map((offer) => [result.page.url, result.page.title, result.page.currentPrice,
       result.page.originalPrice, offer.status, offer.category, offer.label, offer.summary,
-      offer.facts?.threshold, offer.facts?.benefit, offer.facts?.unit, offer.facts?.cap,
+      offer.facts?.threshold, offer.facts?.minQty, offer.facts?.benefit, offer.facts?.unit, offer.facts?.cap,
       offer.checkFound ? (offer.checkSelectable ? '可選' : '不可選') : '',
       offer.fields?.['活動期間'], evidenceFor(offer), offer.reason].map(clean).join('\t'));
     return [header.join('\t'), ...data].join('\n');
@@ -638,6 +910,7 @@
     if (busy) return latest;
     busy = true;
     $('#capture').disabled = true; $('#copyUsable').disabled = true; $('#copyAll').disabled = true;
+    $('#calculate').disabled = true; $('#copyFields').disabled = true;
     try {
       const base = renderPage();
       setProgress('開始讀取頁面優惠…');
@@ -647,9 +920,12 @@
       latest = { page: base.page, pageExclusions: base.exclusions,
         offers: [...discounts, ...promotions, ...couponResult.offers], couponNote: couponResult.note };
       renderResults(latest);
+      $('#priceIncludesPromotion').checked = Boolean(latest.page.priceIncludesPromotion);
+      $('#calculate').disabled = false;
+      calculateFiveFields();
       const usableCount = latest.offers.filter((offer) => offer.status === 'usable').length;
       const reviewCount = latest.offers.filter((offer) => offer.status === 'review').length;
-      setProgress(`擷取完成：可填入 ${usableCount} 項；人工確認 ${reviewCount} 項。未做任何金額計算。`, usableCount ? 'ok' : 'warn');
+      setProgress(`擷取完成：可用 ${usableCount} 項；人工確認 ${reviewCount} 項。已依目前 qty 產生五欄位。`, usableCount ? 'ok' : 'warn');
       return latest;
     } catch (error) {
       console.error('[PChome 優惠擷取助手] 擷取失敗', error);
@@ -689,17 +965,35 @@
     });
   }
 
+  function setCollapsed(collapsed) {
+    const panel = $('.panel');
+    const button = $('#collapse');
+    panel.classList.toggle('is-collapsed', collapsed);
+    button.textContent = collapsed ? '+' : '−';
+    button.title = collapsed ? '展開' : '收合';
+    button.setAttribute('aria-expanded', String(!collapsed));
+  }
+
   function destroy() {
     host.remove();
     if (window.PCHomeJudgementHelper?.version === VERSION) delete window.PCHomeJudgementHelper;
   }
 
+  $('#collapse').addEventListener('click', () => setCollapsed(!$('.panel').classList.contains('is-collapsed')));
   $('#close').addEventListener('click', destroy);
   $('#capture').addEventListener('click', capture);
   $('#copyUsable').addEventListener('click', () => latest && copyText(toTsv(latest, true), $('#copyUsable')));
   $('#copyAll').addEventListener('click', () => latest && copyText(toTsv(latest, false), $('#copyAll')));
+  $('#calculate').addEventListener('click', calculateFiveFields);
+  $('#qtyInput').addEventListener('change', () => latest && calculateFiveFields());
+  $('#priceIncludesPromotion').addEventListener('change', () => latest && calculateFiveFields());
+  $('#copyFields').addEventListener('click', () => latest?.fields
+    && copyText(fiveFieldText(latest.fields), $('#copyFields')));
+  setCollapsed(false);
   enableDragging();
   renderPage();
-  window.PCHomeJudgementHelper = { version: VERSION, capture, result: () => latest, destroy };
-  console.info(`[PChome 優惠擷取助手 v${VERSION}] 已啟動。不計算、不領券；只讀取並分類頁面資訊。`);
+  window.PCHomeJudgementHelper = {
+    version: VERSION, capture, calculate: calculateFiveFields, result: () => latest, destroy,
+  };
+  console.info(`[PChome 優惠擷取助手 v${VERSION}] 已啟動。只讀取頁面，不領券；可計算五個 PChome 欄位。`);
 })();
