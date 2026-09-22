@@ -62,6 +62,7 @@
   const keyword = item.querySelector(
     'a[href*="/products/"] > span'
   )?.textContent.trim();
+
   if (!keyword) return null;
 
   // 酷澎幣
@@ -77,19 +78,29 @@
     .find(el => el.textContent.includes(keyword));
 
   let row = tip?.parentElement;
+
   while (row && !row.querySelector('input[name="coupon"]')) {
     row = row.parentElement;
   }
 
+  // 優惠券金額
   const amount = row?.querySelector('label strong')?.textContent;
+
   const coupon = amount
     ? Number(amount.replace(/[^\d.]/g, ''))
     : null;
 
+  // ===== 新增：判斷是否出現「酷澎首購」 =====
+  const couponText = row?.textContent ?? '';
+
+  const needLogin = !couponText.includes('酷澎首購');
+
   // 最後金額
   const summary = document.querySelector('#rightFloat');
+
   const finalText = summary?.querySelector('#finalOrderPrice')
     ?.getAttribute('data-final-order-price');
+
   if (!finalText) return null;
 
   let price = Number(finalText.replace(/,/g, ''));
@@ -118,7 +129,13 @@
     .filter(value => value !== null)
     .join('+') || 'null';
 
-  const result = `${keyword} $${price}， 回饋+優惠 ${rewards} (酷澎幣${coins}，優惠券${coupon})，原始價格(特價折扣需扣掉)不使用首購、wow會員價`;
+  // 沒有「酷澎首購」時，加上「需登入會員」
+  const loginText = needLogin ? '，需登入會員' : '';
+
+  const result =
+    `${keyword} $${price}， 回饋+優惠 ${rewards} ` +
+    `(酷澎幣${coins}，優惠券${coupon})` +
+    `${loginText}，原始價格(特價折扣需扣掉)不使用首購、wow會員價`;
 
   console.log(result);
   return result;
