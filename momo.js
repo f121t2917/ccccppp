@@ -2,7 +2,7 @@
   'use strict';
 
   const APP_ID = 'momo-judgement-helper';
-  const VERSION = '1.2.2';
+  const VERSION = '1.2.6';
 
   if (window.MomoJudgementHelper?.destroy) window.MomoJudgementHelper.destroy();
   else document.getElementById(APP_ID)?.remove();
@@ -100,18 +100,70 @@
     return null;
   }
 
+  function elementSearchText(element) {
+    if (!(element instanceof Element)) return '';
+    return normalize([
+      element.innerText,
+      element.textContent,
+      element.getAttribute('aria-label'),
+      element.getAttribute('title'),
+      element.getAttribute('alt'),
+      element.getAttribute('data-title'),
+      element.getAttribute('data-tooltip'),
+    ].filter(Boolean).join(' '));
+  }
+
   function findClickableByText(pattern, scope = document) {
-    const nodes = [...scope.querySelectorAll('button, a, [role="button"], summary, span, div, p')];
+    const nodes = [...scope.querySelectorAll(
+      'button, a, [role="button"], summary, span, div, p, em, strong, label, img, [onclick], [tabindex], [aria-label], [title]'
+    )];
     return nodes
       .filter((element) => isVisible(element))
       .map((element) => ({
         element,
-        text: normalize(element.innerText || element.textContent || element.getAttribute('aria-label')),
+        text: elementSearchText(element),
       }))
-      .filter(({ text }) => text && text.length <= 90 && pattern.test(text))
+      .filter(({ text }) => text && text.length <= 140 && pattern.test(text))
       .sort((a, b) => a.text.length - b.text.length)
       .map(({ element }) => clickableFrom(element))
       .find(Boolean) || null;
+  }
+
+  function findCouponEntry(scope = document) {
+    const patterns = [
+      /查看\s*可使用(?:的)?\s*折價券(?:\s*[／/]\s*抵用券)?/,
+      /可使用(?:的)?\s*折價券(?:\s*[／/]\s*抵用券)?/,
+      /查看\s*(?:可用|可使用)\s*折價券/,
+    ];
+
+    for (const pattern of patterns) {
+      const target = findClickableByText(pattern, scope);
+      if (target) return target;
+    }
+
+    // 舊版／一般 MOMO 頁面有時入口文字被拆成多個節點，或只存在 title/aria-label。
+    // 只在同一節點內容同時具有「可使用/可用」與「折價券」時才採用，
+    // 並排除 FAQ / 說明 / 會員中心等非商品頁入口。
+    const nodes = [...scope.querySelectorAll(
+      'button, a, [role="button"], summary, span, div, p, em, strong, label, img, [onclick], [tabindex], [aria-label], [title]'
+    )]
+      .filter((element) => isVisible(element))
+      .map((element) => ({ element, text: elementSearchText(element) }))
+      .filter(({ text }) => (
+        text
+        && text.length <= 180
+        && /折價券/.test(text)
+        && /(?:可使用|可用|查看)/.test(text)
+        && !/(?:折價券說明|FAQ|常見問題|會員中心)/.test(text)
+      ))
+      .sort((a, b) => a.text.length - b.text.length);
+
+    for (const { element } of nodes) {
+      const target = clickableFrom(element);
+      if (target) return target;
+    }
+
+    return null;
   }
 
   function visibleOverlayRoots() {
@@ -123,13 +175,95 @@
       '[class*="drawer"]',
       '[class*="popup"]',
       '[class*="popper"]',
+      '[class*="popover"]',
+      '[class*="overlay"]',
+      '[class*="layer"]',
+      '[class*="sheet"]',
+      '[class*="portal"]',
       '[class*="coupon"]',
     ].join(',');
     return [...document.querySelectorAll(selectors)]
       .filter((element) => isVisible(element))
+      .filter((element) => !element.closest(`#${APP_ID}`))
       .filter((element, index, all) => !all.some((other, otherIndex) => (
-        otherIndex !== index && other.contains(element) && normalize(other.innerText).length < 5000
+        otherIndex !== index
+        && other.contains(element)
+        && normalize(other.innerText || other.textContent).length < 5000
       )));
+  }
+
+  function looksLikeCouponSurface(element) {
+    if (!(element instanceof Element) || !isVisible(element)) return false;
+    if (element.closest(`#${APP_ID}`)) return false;
+
+    const value = normalize(element.innerText || element.textContent);
+    if (value.length < 12 || value.length > 14000) return false;
+
+    const hasCouponContext = /(單品折價券|折價券|抵用券|優惠券)/.test(value);
+    const hasDiscountValue = /(?:折\s*\$?\s*[\d,]+|現折\s*\$?\s*[\d,]+|現抵\s*\$?\s*[\d,]+|折抵\s*\$?\s*[\d,]+|滿\s*\$?\s*[\d,]+|[1-9](?:\.\d+)?\s*折)/.test(value);
+    if (!hasCouponContext || !hasDiscountValue) return false;
+
+    const style = getComputedStyle(element);
+    const zIndex = Number.parseInt(style.zIndex, 10);
+    const overlayLike = ['fixed', 'absolute', 'sticky'].includes(style.position)
+      || (Number.isFinite(zIndex) && zIndex >= 10)
+      || /(?:關閉|單品折價券|可使用(?:的)?折價券|至多\s*5\s*張)/.test(value);
+
+    return overlayLike;
+  }
+
+  function visibleCouponRoots() {
+    const roots = [...visibleOverlayRoots()];
+
+    // 先從常見 portal / body 直屬浮層找，避免新版 MOMO class 名稱完全不同。
+    const broadSelectors = [
+      'body > div',
+      'body > section',
+      'body > aside',
+      '[role="dialog"]',
+      '[aria-modal="true"]',
+      '[class*="overlay"]',
+      '[class*="layer"]',
+      '[class*="portal"]',
+      '[class*="sheet"]',
+      '[class*="popover"]',
+    ].join(',');
+
+    document.querySelectorAll(broadSelectors).forEach((element) => {
+      if (looksLikeCouponSurface(element)) roots.push(element);
+    });
+
+    // 有些 popup 的最外層沒有任何語意 class，只能從「單品折價券」等文字往上找。
+    const anchors = [...document.querySelectorAll(
+      'button, a, [role="button"], span, div, p, strong, em, li, h1, h2, h3, h4'
+    )]
+      .filter((element) => {
+        if (!isVisible(element) || element.closest(`#${APP_ID}`)) return false;
+        const value = normalize(element.innerText || element.textContent);
+        return value.length > 0
+          && value.length <= 180
+          && /(單品折價券|查看\s*可使用(?:的)?\s*折價券|可使用(?:的)?\s*折價券)/.test(value);
+      });
+
+    anchors.forEach((anchor) => {
+      let node = anchor;
+      for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+        if (looksLikeCouponSurface(node)) {
+          roots.push(node);
+          break;
+        }
+      }
+    });
+
+    const uniqueRoots = [...new Set(roots)]
+      .filter((element) => element instanceof Element && isVisible(element));
+
+    // 若同時找到大容器和較精準的小容器，優先留下較內層的小容器。
+    return uniqueRoots.filter((root) => !uniqueRoots.some((other) => (
+      other !== root
+      && root.contains(other)
+      && normalize(other.innerText || other.textContent).length >= 12
+    )));
   }
 
   async function waitForDomChange(beforeText, timeout = 2600) {
@@ -232,6 +366,90 @@
     ));
   }
 
+
+  function couponContextLabelFromRoot(root) {
+    if (!(root instanceof Element || root instanceof Document)) return '';
+    const scope = root instanceof Document ? root.documentElement : root;
+    const value = normalize(scope.innerText || scope.textContent);
+
+    if (/單品折價券/.test(value)) return '單品折價券';
+    if (/單店抵用券/.test(value)) return '單店抵用券';
+    if (/商店抵用券/.test(value)) return '商店抵用券';
+    if (/(店家券|店券|賣場券|商店券)/.test(value)) return '賣場券';
+    return '';
+  }
+
+  function collectCouponTableRows(root) {
+    if (!(root instanceof Element || root instanceof Document)) return [];
+
+    const scope = root instanceof Document ? root.documentElement : root;
+    const contextLabel = couponContextLabelFromRoot(scope);
+    if (!contextLabel) return [];
+
+    const rows = [];
+    const seen = new Set();
+
+    scope.querySelectorAll('table tr, tbody tr, [role="row"]').forEach((row) => {
+      if (!(row instanceof Element) || !isVisible(row)) return;
+      if (row.closest(`#${APP_ID}`)) return;
+
+      let value = normalize(row.innerText || row.textContent);
+      if (!value || value.length < 4 || value.length > 900) return;
+
+      const hasDiscountValue = DISCOUNT_VALUE_RE.test(value)
+        || /滿\s*\$?\s*[\d,]+\s*(?:元)?\s*(?:折|現折|現抵|折抵)\s*\$?\s*[\d,]+/.test(value)
+        || /商品折抵後金額\s*\$?\s*[\d,]+/.test(value);
+
+      if (!hasDiscountValue) return;
+
+      if (!COUPON_TYPE_RE.test(value)) value = `${contextLabel} ${value}`;
+
+      value = normalize(value);
+      if (seen.has(value)) return;
+      seen.add(value);
+      rows.push(value);
+    });
+
+    return rows;
+  }
+
+
+  function couponContentSnapshot() {
+    const roots = visibleCouponRoots();
+    const rootTexts = roots.map((root) => normalize(root.innerText || root.textContent));
+    const joined = normalize(rootTexts.join('\n'));
+
+    const tableRows = collectCouponTableRows(document);
+    const hasCouponContext = /(單品折價券|最優惠折價券|可使用(?:的)?折價券|折價券適用)/.test(joined);
+    const hasRealDiscount = tableRows.length > 0
+      || /滿\s*\$?\s*[\d,]+\s*(?:元)?\s*(?:折|現折|現抵|折抵)\s*\$?\s*[\d,]+/.test(joined)
+      || /商品折抵後金額\s*\$?\s*[\d,]+/.test(joined);
+    const loading = /(?:載入中|讀取中|loading|請稍候|資料載入)/i.test(joined) && !hasRealDiscount;
+
+    return {
+      roots,
+      tableRows,
+      text: joined,
+      hasCouponContext,
+      hasRealDiscount,
+      loading,
+      ready: roots.length > 0 && hasCouponContext && hasRealDiscount && !loading,
+    };
+  }
+
+  async function waitForCouponContentReady(timeout = 6500) {
+    const start = performance.now();
+    let last = couponContentSnapshot();
+
+    while (performance.now() - start < timeout) {
+      last = couponContentSnapshot();
+      if (last.ready) return last;
+      await sleep(150);
+    }
+
+    return last;
+  }
+
   function captureOfferTextsFromRoot(root, sourceLabel = '') {
     if (!(root instanceof Element)) return [];
 
@@ -239,13 +457,16 @@
     const couponContext = /單品折價券/.test(rootText);
     const keyword = /(折|券|回饋|加碼|MO幣|mo幣|momo幣|MO點|mo點|momo點|免運|運費|moPro|mopro|跨店|跨館|贈品|滿\s*[\d,]+)/i;
     const selectors = [
-      'li', 'p', 'button', 'a', 'span', '[role="button"]',
+      'li', 'p', 'button', 'a', 'span', 'table', 'tbody', 'tr', 'td', 'th',
+      '[role="button"]', '[role="row"]', '[role="cell"]',
       '[class*="promotion"]', '[class*="discount"]', '[class*="coupon"]',
       '[class*="activity"]', '[class*="benefit"]', '[class*="gift"]', '[class*="shipping"]',
     ].join(',');
 
     const items = [];
     const couponCards = collectCouponCards(root);
+
+    items.push(...collectCouponTableRows(root));
 
     // 優惠券以「整張卡片」為最小單位，只抓一次。
     couponCards.forEach((card) => {
@@ -268,6 +489,8 @@
       // 就不能再獨立變成另一筆「折$10 / 折$18」優惠。
       if (elementTouchesCouponCard(element, couponCards)) return;
 
+      if (element.closest('table') || element.matches('table, tbody, tr, td, th, [role="row"], [role="cell"]')) return;
+
       let value = normalize(element.innerText || element.textContent);
       if (value.length < 4 || value.length > 280 || !keyword.test(value)) return;
 
@@ -282,6 +505,78 @@
 
     // 不把 [來源] 接到優惠文字尾端，避免同一優惠因來源字串不同而無法去重。
     return unique(items);
+  }
+
+
+  async function captureOpenCouponSurfaces({ clickCouponTab = false } = {}) {
+    let snapshot = await waitForCouponContentReady(6500);
+    let roots = snapshot.roots;
+    let clickedTab = false;
+
+    // 只有「內容還沒準備好」時才嘗試切單品折價券分頁。
+    // 若 popup 本身已直接顯示單品折價券表格，就不要多點一次。
+    if (clickCouponTab && !snapshot.ready) {
+      for (const root of roots) {
+        const tab = findClickableByText(
+          /單品折價券(?:\s*[（(].*?(?:至多\s*5\s*張|最優惠).*?[）)])?/,
+          root
+        );
+        if (!tab) continue;
+
+        try {
+          const before = visiblePageText();
+          tab.click();
+          clickedTab = true;
+          await waitForDomChange(before, 1800);
+          await sleep(160);
+        } catch (_) { /* ignore */ }
+        break;
+      }
+      snapshot = await waitForCouponContentReady(6500);
+      roots = snapshot.roots;
+    }
+
+    // 即使沒有可點 tab，也再等一次；MOMO popup 可能先出外框、稍後才灌入 table。
+    if (!snapshot.ready) {
+      snapshot = await waitForCouponContentReady(6500);
+      roots = snapshot.roots;
+    }
+
+    let captured = [];
+    roots.forEach((root) => {
+      captured.push(...captureOfferTextsFromRoot(root, '目前可見折價券視窗'));
+    });
+
+    // 最後再從整個 document 收一次「可見的完整券卡」。
+    // 這能處理 popup 是 portal，但外層完全沒有 modal/coupon class 的情況。
+    const documentCards = collectCouponCards(document)
+      .filter((card) => isVisible(card) && !card.closest(`#${APP_ID}`));
+
+    documentCards.forEach((card) => {
+      const value = normalize(card.innerText || card.textContent);
+      if (value) captured.push(value);
+    });
+
+    captured = unique(captured);
+
+    if (captured.length) {
+      state.capturedOfferTexts = unique([
+        ...(state.capturedOfferTexts || []),
+        ...captured,
+      ]);
+    }
+
+    state.popupScanInfo = {
+      roots: roots.length,
+      cards: documentCards.length,
+      captured: captured.length,
+      tableRows: snapshot.tableRows?.length || 0,
+      clickedTab,
+      ready: Boolean(snapshot.ready),
+      loading: Boolean(snapshot.loading),
+    };
+
+    return state.popupScanInfo;
   }
 
   function closeVisibleOverlay() {
@@ -300,8 +595,10 @@
     return false;
   }
 
-  async function clickAndCapture(label, pattern, { clickCouponTab = false } = {}) {
-    const target = findClickableByText(pattern);
+  async function clickAndCapture(label, pattern, { clickCouponTab = false, finder = null } = {}) {
+    const target = typeof finder === 'function'
+      ? finder()
+      : findClickableByText(pattern);
     if (!target) return { label, found: false, clicked: false, changed: false, captured: 0 };
 
     const before = visiblePageText();
@@ -312,37 +609,49 @@
       return { label, found: true, clicked: false, changed: false, captured: 0 };
     }
 
-    const changed = await waitForDomChange(before);
-    await sleep(180);
+    let changed = false;
 
     if (clickCouponTab) {
-      const roots = visibleOverlayRoots();
-      for (const root of roots) {
-        const tab = findClickableByText(/單品折價券(?:\s*[（(].*至多\s*5\s*張.*[）)])?/, root);
-        if (tab && tab !== target) {
-          try {
-            const tabBefore = visiblePageText();
-            tab.click();
-            await waitForDomChange(tabBefore, 1800);
-            await sleep(120);
-          } catch (_) { /* ignore */ }
-          break;
-        }
-      }
+      const snapshot = await waitForCouponContentReady(6500);
+      changed = snapshot.ready || visiblePageText() !== before;
+
+      // 等真正券內容出現後再擷取；不要只因 popup 外框出現就繼續。
+      await captureOpenCouponSurfaces({ clickCouponTab: true });
+    } else {
+      changed = await waitForDomChange(before);
+      await sleep(180);
     }
 
-    const roots = visibleOverlayRoots();
+    const roots = visibleCouponRoots();
     let captured = [];
     roots.forEach((root) => {
       captured.push(...captureOfferTextsFromRoot(root, label));
     });
+
+    // document 級可見券卡也一併補抓，避免新版 portal 被漏掉。
+    collectCouponCards(document)
+      .filter((card) => isVisible(card) && !card.closest(`#${APP_ID}`))
+      .forEach((card) => {
+        const value = normalize(card.innerText || card.textContent);
+        if (value) captured.push(value);
+      });
+
     captured = unique(captured);
     if (captured.length) {
       state.capturedOfferTexts = unique([...(state.capturedOfferTexts || []), ...captured]);
     }
 
-    // 盡量把 modal 關掉，避免遮住下一個入口；關不掉也不視為失敗。
-    if (roots.length) {
+    state.popupScanInfo = {
+      roots: roots.length,
+      cards: collectCouponCards(document).filter((card) => isVisible(card)).length,
+      captured: captured.length,
+      clickedTab: Boolean(clickCouponTab),
+    };
+
+    // 折價券是 autoExpandOffers 的最後一個 job，而且內容為非同步載入。
+    // 不再自動關閉折價券 popup，避免 table 尚未完整載入就被關掉。
+    // 其他活動 popup 仍可自動關閉，方便繼續下一個 job。
+    if (!clickCouponTab && visibleOverlayRoots().length) {
       closeVisibleOverlay();
       await sleep(160);
     }
@@ -359,7 +668,7 @@
     const jobs = [
       ['下單再折', /^下單再折/],
       ['折扣活動／活動說明', /^(?:折扣活動|活動說明|優惠活動|促銷活動)(?:\s|$|[（(])/],
-      ['可使用的折價券／抵用券', /查看可使用的折價券(?:\s*\/\s*抵用券)?|可使用的折價券\s*\/\s*抵用券/, { clickCouponTab: true }],
+      ['可使用的折價券／抵用券', /查看\s*可使用(?:的)?\s*折價券(?:\s*[／/]\s*抵用券)?|可使用(?:的)?\s*折價券(?:\s*[／/]\s*抵用券)?/, { clickCouponTab: true, finder: () => findCouponEntry(document) }],
     ];
 
     for (const [label, pattern, options] of jobs) {
@@ -573,12 +882,40 @@
       || document;
     const registrationTexts = [];
 
-    // 頁面上可見的商店/單店/單品券，整張卡片只產生一筆 offer。
-    const couponCards = collectCouponCards(productScope);
+    // 頁面商品區 + 目前可見 popup 的券卡都要掃。
+    // 原本只掃 productScope，手動開啟的 portal popup 可能掛在 body 下而完全被漏掉。
+    const productCouponCards = collectCouponCards(productScope);
+    const documentCouponCards = collectCouponCards(document)
+      .filter((card) => isVisible(card) && !card.closest(`#${APP_ID}`));
+    const couponCards = [...new Set([...productCouponCards, ...documentCouponCards])];
+
     couponCards.forEach((card) => {
       const cardText = normalize(card.innerText || card.textContent);
       if (cardText) texts.push(cardText);
     });
+
+    const visibleCouponSurfaces = visibleCouponRoots();
+    let popupCapturedCount = 0;
+    visibleCouponSurfaces.forEach((root) => {
+      const captured = captureOfferTextsFromRoot(root, '目前可見折價券視窗');
+      popupCapturedCount += captured.length;
+      texts.push(...captured);
+    });
+
+    const documentCouponRows = collectCouponTableRows(document)
+      .filter((value) => value && value.length <= 900);
+    if (documentCouponRows.length) {
+      texts.push(...documentCouponRows);
+      popupCapturedCount += documentCouponRows.length;
+    }
+
+    state.popupScanInfo = {
+      ...(state.popupScanInfo || {}),
+      roots: visibleCouponSurfaces.length,
+      cards: documentCouponCards.length,
+      captured: Math.max(state.popupScanInfo?.captured || 0, popupCapturedCount),
+      tableRows: documentCouponRows.length,
+    };
     [...productScope.querySelectorAll('div')].forEach((row) => {
       const directChildren = [...row.children];
       const registrationLabel = directChildren.find((child) => normalize(child.textContent) === '登記送');
@@ -693,6 +1030,7 @@
   const state = {
     facts: getPageFacts(), offers: [], output: null, collapsed: false,
     capturedOfferTexts: [], autoExpandLog: [], autoExpanding: false,
+    popupScanInfo: { roots: 0, cards: 0, captured: 0, tableRows: 0, clickedTab: false, ready: false, loading: false },
   };
   state.offers = scanOfferTexts(state.facts.mode);
 
@@ -771,7 +1109,11 @@
       acc[offer.status] = (acc[offer.status] || 0) + 1;
       return acc;
     }, {});
-    $('#offerSummary').textContent = `共掃描 ${state.offers.length} 項：可用 ${counts.usable || 0}、忽略 ${counts.ignore || 0}、只備註 ${counts.note || 0}、排除 ${counts.reject || 0}、待確認 ${counts.review || 0}。`;
+    const popup = state.popupScanInfo || {};
+    const popupInfo = (popup.roots || popup.cards || popup.captured || popup.tableRows)
+      ? ` ｜ 折價券視窗：${popup.roots || 0} 個，券卡 ${popup.cards || 0} 張，表格券列 ${popup.tableRows || 0} 列，擷取 ${popup.captured || 0} 段，${popup.ready ? '內容已載入' : (popup.loading ? '仍在載入' : '內容未就緒')}`
+      : '';
+    $('#offerSummary').textContent = `共掃描 ${state.offers.length} 項：可用 ${counts.usable || 0}、忽略 ${counts.ignore || 0}、只備註 ${counts.note || 0}、排除 ${counts.reject || 0}、待確認 ${counts.review || 0}。${popupInfo}`;
     $('#offers').innerHTML = state.offers.length ? state.offers.map((offer) => `
       <div class="offer">
         <div class="offer-top"><span class="tag ${offer.status}">${escapeHtml(offer.status === 'usable' ? '可用' : offer.status === 'reject' ? '排除' : offer.status === 'note' ? '備註' : offer.status === 'ignore' ? '忽略' : '待確認')}</span><span class="tag">${escapeHtml(CATEGORY_LABELS[offer.category])}</span></div>
@@ -792,7 +1134,17 @@
       return;
     }
     node.textContent = state.autoExpandLog.map((item) => {
-      if (!item.found) return `${item.label}：找不到入口`;
+      if (!item.found) {
+        if (item.label === '可使用的折價券／抵用券') {
+          const couponHints = [...document.querySelectorAll('a,button,span,div,[aria-label],[title]')]
+            .filter((el) => isVisible(el))
+            .map((el) => elementSearchText(el))
+            .filter((t) => t && t.length <= 120 && /折價券/.test(t))
+            .slice(0, 5);
+          return `${item.label}：找不到入口${couponHints.length ? `（頁面可見折價券文字：${couponHints.join(' ｜ ')}）` : ''}`;
+        }
+        return `${item.label}：找不到入口`;
+      }
       if (!item.clicked) return `${item.label}：找到但無法點擊`;
       const capture = item.captured ? `，擷取 ${item.captured} 段文字` : '';
       return `${item.label}：已點擊${item.changed ? '並偵測到頁面變化' : ''}${capture}`;
@@ -1104,12 +1456,30 @@
     state.offers = scanOfferTexts(state.facts.mode);
     renderOffers();
   });
-  $('#rescan').addEventListener('click', () => {
-    const selectedMode = $('#mode').value;
-    state.facts = getPageFacts();
-    state.facts.mode = selectedMode;
-    state.offers = scanOfferTexts(state.facts.mode);
-    renderFacts(); renderOffers(); renderAutoStatus();
+  $('#rescan').addEventListener('click', async () => {
+    const button = $('#rescan');
+    if (button) button.disabled = true;
+
+    try {
+      const selectedMode = $('#mode').value;
+
+      // 使用者若已手動打開「查看可使用的折價券」，
+      // 先從目前可見浮層抓資料，並安全嘗試切到「單品折價券」分頁。
+      await captureOpenCouponSurfaces({ clickCouponTab: true });
+
+      state.facts = getPageFacts();
+      state.facts.mode = selectedMode;
+      state.offers = scanOfferTexts(state.facts.mode);
+      renderFacts();
+      renderOffers();
+
+      const info = state.popupScanInfo || {};
+      $('#autoStatus').textContent = (info.roots || info.cards || info.captured || info.tableRows)
+        ? `人工開啟折價券後掃描：偵測 ${info.roots || 0} 個折價券視窗／${info.cards || 0} 張券卡／${info.tableRows || 0} 列表格券／擷取 ${info.captured || 0} 段文字／${info.ready ? '內容已載入' : (info.loading ? '仍在載入' : '內容未就緒')}${info.clickedTab ? '，已嘗試切到單品折價券分頁' : ''}`
+        : '目前沒有偵測到可見的折價券視窗或券卡；若視窗確實開著，請保留視窗並再次按「只重新掃描」。';
+    } finally {
+      if (button) button.disabled = false;
+    }
   });
   $('#copyValues').addEventListener('click', (event) => {
     if (!state.output) return;
