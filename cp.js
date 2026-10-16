@@ -7,6 +7,10 @@
   const getItem = () => document.getElementById(itemId);
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+  // 統一連續空白，避免商品名稱比對失敗
+  const normalize = text =>
+    (text ?? '').replace(/\s+/g, ' ').trim();
+
   // 未勾選時，先勾選商品
   const checkbox = item.querySelector('input[type="checkbox"]');
   if (!checkbox) throw new Error('找不到商品勾選框');
@@ -32,7 +36,13 @@
       const total = summary?.querySelector('#finalOrderPrice')
         ?.getAttribute('data-final-order-price');
 
-      const state = summary?.textContent ?? '';
+      // 同時檢查金額與優惠券內容是否穩定
+      const state = JSON.stringify([
+        total,
+        summary?.textContent ?? '',
+        [...document.querySelectorAll('.coupon-condition .d1')]
+          .map(el => el.textContent)
+      ]);
 
       if (state !== previous) {
         previous = state;
@@ -59,9 +69,9 @@
   item = getItem();
   if (!item) return null;
 
-  const keyword = item.querySelector(
-    'a[href*="/products/"] > span'
-  )?.textContent.trim();
+  const keyword = normalize(
+    item.querySelector('a[href*="/products/"] > span')?.textContent
+  );
 
   if (!keyword) return null;
 
@@ -73,26 +83,33 @@
     ? Number(coinsText.replace(/,/g, ''))
     : null;
 
-  // 商品對應的優惠券
+  // 商品名稱符合就抓取，不排除「條件不符」的優惠券
   const tip = [...document.querySelectorAll('.coupon-condition .d1')]
-    .find(el => el.textContent.includes(keyword));
+    .find(el => normalize(el.textContent).includes(keyword));
 
-  let row = tip?.parentElement;
+  // 優先取得完整優惠券列，讓券名也包含在內
+  let row = tip?.closest('.list');
 
-  while (row && !row.querySelector('input[name="coupon"]')) {
-    row = row.parentElement;
+  // 相容沒有 .list 的頁面結構
+  if (!row && tip) {
+    row = tip.parentElement;
+
+    while (row && !row.querySelector('input[name="coupon"]')) {
+      row = row.parentElement;
+    }
   }
 
-  // 優惠券金額
+  // 優惠券金額：百分比券不直接當成金額
   const amount = row?.querySelector('label strong')?.textContent;
+  const couponMatch = amount?.match(/\$\s*([\d,]+(?:\.\d+)?)/);
 
-  const coupon = amount
-    ? Number(amount.replace(/[^\d.]/g, ''))
+  const coupon = couponMatch
+    ? Number(couponMatch[1].replace(/,/g, ''))
     : null;
 
-  // ===== 新增：判斷是否出現「酷澎首購」 =====
+  // 保留原本的輸出規則：沒有「酷澎首購」就標示需登入會員
+  // 這是文案判斷，並非實際登入狀態
   const couponText = row?.textContent ?? '';
-
   const needLogin = !couponText.includes('酷澎首購');
 
   // 最後金額
@@ -114,11 +131,11 @@
     const labelElement = [...(priceSummary?.querySelectorAll('div') ?? [])]
       .find(el =>
         el.children.length === 0 &&
-        el.textContent.trim() === label
+        normalize(el.textContent) === label
       );
 
-    const discountText = labelElement?.parentElement.textContent
-      .match(/\$\s*([\d,]+(?:\.\d+)?)/)?.[1];
+    const discountText = labelElement?.parentElement?.textContent
+      ?.match(/\$\s*([\d,]+(?:\.\d+)?)/)?.[1];
 
     if (discountText) {
       price += Number(discountText.replace(/,/g, ''));
@@ -129,7 +146,6 @@
     .filter(value => value !== null)
     .join('+') || 'null';
 
-  // 沒有「酷澎首購」時，加上「需登入會員」
   const loginText = needLogin ? '，需登入會員' : '';
 
   const result =
