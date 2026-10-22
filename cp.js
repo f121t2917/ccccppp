@@ -6,8 +6,6 @@
   const itemId = item.id;
   const getItem = () => document.getElementById(itemId);
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-  // 統一連續空白，避免商品名稱比對失敗
   const normalize = text =>
     (text ?? '').replace(/\s+/g, ' ').trim();
 
@@ -17,52 +15,67 @@
 
   if (!checkbox.checked) {
     if (checkbox.disabled) throw new Error('這件商品目前無法勾選');
-
     checkbox.click();
+  }
 
-    // 等待勾選成功且訂單金額穩定，最多等 10 秒
-    const start = Date.now();
-    let previous = '';
-    let stableSince = Date.now();
-    let ready = false;
+  // 不論原本是否勾選，都等待商品、金額與優惠券資料穩定
+  const start = Date.now();
+  let previous = '';
+  let stableSince = start;
+  let ready = false;
 
-    while (Date.now() - start < 10000) {
-      await sleep(250);
+  while (Date.now() - start < 10000) {
+    await sleep(250);
 
-      const checked = getItem()
-        ?.querySelector('input[type="checkbox"]')?.checked;
+    const currentItem = getItem();
+    const checked = currentItem
+      ?.querySelector('input[type="checkbox"]')?.checked;
 
-      const summary = document.querySelector('#rightFloat');
-      const total = summary?.querySelector('#finalOrderPrice')
-        ?.getAttribute('data-final-order-price');
+    const summary = document.querySelector('#rightFloat');
+    const total = summary?.querySelector('#finalOrderPrice')
+      ?.getAttribute('data-final-order-price');
 
-      // 同時檢查金額與優惠券內容是否穩定
-      const state = JSON.stringify([
-        total,
-        summary?.textContent ?? '',
-        [...document.querySelectorAll('.coupon-condition .d1')]
-          .map(el => el.textContent)
-      ]);
+    // 不包含商品倒數計時，避免每秒變動導致無法穩定
+    const state = JSON.stringify([
+      checked,
+      total,
+      summary?.textContent ?? '',
+      currentItem?.querySelector('[data-component-id="benefit"]')
+        ?.textContent ?? '',
+      [...document.querySelectorAll(
+        'input[name="coupon"][type="checkbox"]'
+      )].map(input => {
+        const row = input.closest('.list');
 
-      if (state !== previous) {
-        previous = state;
-        stableSince = Date.now();
-      }
+        return [
+          input.value,
+          input.checked,
+          input.disabled,
+          row?.querySelector('label strong')?.textContent ?? '',
+          [...(row?.querySelectorAll('.coupon-condition .d1') ?? [])]
+            .map(el => normalize(el.textContent))
+        ];
+      })
+    ]);
 
-      if (
-        checked &&
-        Number(total?.replace(/,/g, '')) > 0 &&
-        Date.now() - start >= 1500 &&
-        Date.now() - stableSince >= 1000
-      ) {
-        ready = true;
-        break;
-      }
+    if (state !== previous) {
+      previous = state;
+      stableSince = Date.now();
     }
 
-    if (!ready) {
-      throw new Error('商品或金額尚未更新完成，請稍後重新執行');
+    if (
+      checked &&
+      Number(total?.replace(/,/g, '')) > 0 &&
+      Date.now() - start >= 1500 &&
+      Date.now() - stableSince >= 1000
+    ) {
+      ready = true;
+      break;
     }
+  }
+
+  if (!ready) {
+    throw new Error('商品或金額尚未更新完成，請稍後重新執行');
   }
 
   // 更新後重新取得商品 DOM
@@ -77,29 +90,51 @@
 
   // 酷澎幣
   const coinsText = item.textContent
-    .match(/\$\s*([\d,]+)\s*酷澎幣回饋/)?.[1];
+    .match(/\$\s*([\d,]+(?:\.\d+)?)\s*酷澎幣回饋/)?.[1];
 
   const coins = coinsText
     ? Number(coinsText.replace(/,/g, ''))
     : null;
 
-  // 商品名稱符合就抓取，不排除「條件不符」的優惠券
-  const tip = [...document.querySelectorAll('.coupon-condition .d1')]
-    .find(el => normalize(el.textContent).includes(keyword));
+  // 商品編號
+  const productLink = item.querySelector('a[href*="/products/"]');
 
-  // 優先取得完整優惠券列，讓券名也包含在內
-  let row = tip?.closest('.list');
+  const vendorItemId =
+    item.getAttribute('data-vid') ||
+    (productLink
+      ? new URL(productLink.href, location.href)
+          .searchParams.get('vendorItemId')
+      : null);
 
-  // 相容沒有 .list 的頁面結構
-  if (!row && tip) {
-    row = tip.parentElement;
+  // 收集優惠券列，不排除「條件不符」
+  const rows = [...new Set(
+    [...document.querySelectorAll(
+      'input[name="coupon"][type="checkbox"]'
+    )]
+      .map(input => input.closest('.list'))
+      .filter(Boolean)
+  )];
 
-    while (row && !row.querySelector('input[name="coupon"]')) {
-      row = row.parentElement;
-    }
+  // 優先用商品編號比對，避免名稱與規格順序不同
+  let row = vendorItemId
+    ? rows.find(candidate =>
+        [...candidate.querySelectorAll('[data-ccm-manage-code]')]
+          .some(el => {
+            const code = el.getAttribute('data-ccm-manage-code') ?? '';
+            return code.split('_').pop() === vendorItemId;
+          })
+      )
+    : null;
+
+  // 找不到商品編號時，退回統一空白後的名稱比對
+  if (!row) {
+    row = rows.find(candidate =>
+      [...candidate.querySelectorAll('.coupon-condition .d1')]
+        .some(el => normalize(el.textContent).includes(keyword))
+    );
   }
 
-  // 優惠券金額：百分比券不直接當成金額
+  // 優惠券金額：百分比券不當成金額
   const amount = row?.querySelector('label strong')?.textContent;
   const couponMatch = amount?.match(/\$\s*([\d,]+(?:\.\d+)?)/);
 
@@ -107,8 +142,7 @@
     ? Number(couponMatch[1].replace(/,/g, ''))
     : null;
 
-  // 保留原本的輸出規則：沒有「酷澎首購」就標示需登入會員
-  // 這是文案判斷，並非實際登入狀態
+  // 保留原本的文案規則，並非判斷實際登入狀態
   const couponText = row?.textContent ?? '';
   const needLogin = !couponText.includes('酷澎首購');
 
@@ -122,7 +156,7 @@
 
   let price = Number(finalText.replace(/,/g, ''));
 
-  // 逐一判斷：只加回這兩種折扣
+  // 只加回首購優惠折扣與優惠券折扣
   const priceSummary = summary.querySelector(
     '[data-component-id="total-price"]'
   );
